@@ -1,6 +1,7 @@
 package common
 
 import (
+	"crypto/subtle"
 	"strings"
 	"sync"
 	"time"
@@ -9,8 +10,9 @@ import (
 )
 
 type verificationValue struct {
-	code string
-	time time.Time
+	code     string
+	time     time.Time
+	attempts int
 }
 
 const (
@@ -22,6 +24,11 @@ var verificationMutex sync.Mutex
 var verificationMap map[string]verificationValue
 var verificationMapMaxSize = 10
 var VerificationValidMinutes = 10
+
+// VerificationMaxAttempts caps failed verifications per registered code. A code
+// is dropped once the cap is reached, so a short code cannot be brute forced by
+// repeating a single request; the caller has to request a new code.
+var VerificationMaxAttempts = 5
 
 func GenerateVerificationCode(length int) string {
 	code := uuid.New().String()
@@ -44,15 +51,31 @@ func RegisterVerificationCodeWithKey(key string, code string, purpose string) {
 	}
 }
 
+// VerifyCodeWithKey reports whether code matches the code registered for key and
+// purpose. The comparison is constant-time, and a failed attempt is charged
+// against the code: reaching VerificationMaxAttempts drops the code entirely.
 func VerifyCodeWithKey(key string, code string, purpose string) bool {
 	verificationMutex.Lock()
 	defer verificationMutex.Unlock()
-	value, okay := verificationMap[purpose+key]
+	mapKey := purpose + key
+	value, okay := verificationMap[mapKey]
 	now := time.Now()
 	if !okay || int(now.Sub(value.time).Seconds()) >= VerificationValidMinutes*60 {
+		delete(verificationMap, mapKey)
 		return false
 	}
-	return code == value.code
+	if subtle.ConstantTimeCompare([]byte(code), []byte(value.code)) != 1 {
+		value.attempts++
+		if value.attempts >= VerificationMaxAttempts {
+			delete(verificationMap, mapKey)
+			return false
+		}
+		verificationMap[mapKey] = value
+		return false
+	}
+	value.attempts = 0
+	verificationMap[mapKey] = value
+	return true
 }
 
 func DeleteKey(key string, purpose string) {

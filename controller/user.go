@@ -298,6 +298,12 @@ func Register(c *gin.Context) {
 		common.ApiErrorI18n(c, i18n.MsgUserRegisterFailed)
 		return
 	}
+	if common.EmailVerificationEnabled {
+		// The code is one-time: it is dropped only after the account exists, so a
+		// registration rejected for another reason (username taken, for example)
+		// does not force the user to request a new code.
+		common.DeleteKey(user.Email, common.EmailVerificationPurpose)
+	}
 	// 生成默认令牌
 	if constant.GenerateDefaultToken {
 		key, err := common.GenerateKey()
