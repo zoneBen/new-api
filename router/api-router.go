@@ -22,7 +22,7 @@ func SetApiRouter(router *gin.Engine) {
 	anonymousRequestBodyLimit := middleware.AnonymousRequestBodyLimit()
 	{
 		apiRouter.GET("/setup", controller.GetSetup)
-		apiRouter.POST("/setup", anonymousRequestBodyLimit, controller.PostSetup)
+		apiRouter.POST("/setup", middleware.SetupAccessGuard(), anonymousRequestBodyLimit, controller.PostSetup)
 		apiRouter.GET("/status", controller.GetStatus)
 		apiRouter.GET("/uptime/status", controller.GetUptimeKumaStatus)
 		apiRouter.GET("/models", middleware.UserAuth(), controller.DashboardListModels)

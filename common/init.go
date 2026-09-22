@@ -66,6 +66,10 @@ func InitEnv() {
 		log.Fatal(err)
 	}
 	initUserSessionSettings()
+	if strings.TrimSpace(os.Getenv("SETUP_TOKEN")) == "" && !constant.Setup {
+		log.Println("WARNING: SETUP_TOKEN is unset and the system is not initialized yet; POST /api/setup only accepts direct local or private-network requests without proxy headers. Set SETUP_TOKEN before exposing a new instance to the internet.")
+		log.Println("警告：SETUP_TOKEN 未设置且系统尚未初始化，POST /api/setup 仅接受本机或内网直连且无代理头的请求。将新实例暴露到公网前请先设置 SETUP_TOKEN。")
+	}
 	if os.Getenv("SQLITE_PATH") != "" {
 		SQLitePath = os.Getenv("SQLITE_PATH")
 	}
