@@ -22,6 +22,7 @@
 | --- | --- |
 | 🛠️ 已修复 | 已在本分支实现、验证并提交（附 commit 短哈希） |
 | 🚧 部分修复 | 只落地了其中一部分，剩余项在该节内单独列出 |
+| ❌ 未修复 | 已评估但本分支刻意不改，理由写在该节内 |
 | （无标记） | 尚未处理 |
 
 修复记录见 [§1.1 修复进度](#11-修复进度)。标记只描述"本分支做了什么"，不改变原始问题的严重程度评估。
@@ -110,6 +111,7 @@
 | --- | --- | --- | --- |
 | P0-1 `/api/setup` 未授权创建 root | 🛠️ 已修复 | `91f20bae3` | `go build ./...`、`go vet`、`go test ./middleware/ ./common/ ./router/` 通过；17 个子用例覆盖令牌/回环/内网/公网/伪造 `X-Forwarded-For`/反向代理 |
 | P0-2 MJ 图片代理越权读取 | 🛠️ 已修复 | `38ddfde30` | `go build ./...`、`go vet`、`go test ./relay/ ./service/ ./controller/` 通过；路由级用例覆盖无签名/篡改/他人任务签名被拒且不触达上游，正确签名返回 200 + `image/png` |
+| P0-3 验证码与登录缺乏账户级限制 | 🚧 部分修复 | `927ab209e` 验证码<br>`6ec801848` 登录计时<br>`d3c953c7a` 代理告警<br>`826ee1357` 账户锁定 | `go build ./...`、`go vet ./...`、`go test ./controller/ ./service/ ./common/` 通过；`go test -race` 覆盖新增用例。剩余：`TRUSTED_PROXIES` 失败关闭（默认值未改，代价已写入告警与 `.env.example`）、验证码发送侧按邮箱限额、重置密码回显（需前后端联动） |
 
 ---
 
@@ -191,6 +193,13 @@ Gin 的 `Use` 只作用于其后注册的路由，因此 `/mj/image/:id` 与 `/:
 4. 密码重置响应中不再回显新密码。
 
 **验收.** 针对单一邮箱连续错误验证码会触发锁定；伪造 `X-Forwarded-For` 不再改变限流桶；不存在账号与存在账号的登录响应耗时无稳定差异。
+
+**🛠️ 部分修复（`927ab209e`、`6ec801848`、`d3c953c7a`、`826ee1357`）.**
+- **① 验证码校验 —— 🛠️ 已修复（`927ab209e`）.** `VerifyCodeWithKey` 改用 `subtle.ConstantTimeCompare`；`verificationValue` 增加 `attempts`，上限 `common.VerificationMaxAttempts = 5`，失败计数达到上限即删除该 key（验证码作废，需重新申请）。成功时计数归零但**不**删除 key——删除仍由调用方在业务成功后显式执行，因此"注册因用户名被占用而失败"不会白白消耗验证码（`controller/user.go` 改为插入成功后才 `DeleteKey`）。过期与未知 key 行为不变。测试：`common/verification_test.go`（新文件，5 个用例）。
+- **② 客户端 IP 可伪造 —— 🚧 部分修复（`d3c953c7a`）.** **默认值未改动**，理由与 P0-2 同属对本文档原建议的修正：把 `TRUSTED_PROXIES` 默认置空后，`ClientIP()` 取直连对端地址，容器 `-p` 发布端口场景下所有外部客户端都是同一个 Docker 网关地址、退化为共用同一限流桶；这是部署策略取舍而非纯收益，不应静默改变。已做的是把代价讲清楚：启动告警补充"私网来源可伪造 `X-Forwarded-For` 自选限流桶、冒充令牌 IP 白名单来源，容器发布端口与原样转发客户端头的反代都落入该情形"，`.env.example` 同时写明 `none` 的代价与"按账户维度限制兜底"的指向。**剩余**：在无法归属到可信跳点时让 `ClientIP()` 失败关闭（忽略该头）而非回退默认值。
+- **③ 登录计时差异 + 账户级锁定 —— 🛠️ 已修复（`6ec801848` + `826ee1357`）.** 计时：`model/user.go` 两条 miss 早返回路径都调用 `common.EqualizePasswordVerificationCost`，用与配置算法一致的占位 hash 跑一次完整校验。锁定：新增 `service/login_attempt_limit.go`，按**提交的名字**（`ToLower`+`TrimSpace` 后 HMAC 哈希入 key，原始用户名不进入内存/Redis key）维护 20 次 / 15 分钟窗口；检查在凭据查询**之前**执行，故锁定不泄露账号是否存在、未知用户名同样消耗预算；DB 报错不计入预算，成功登录清零。计数在 Redis 配置时用 `SetNX`+`Incr`（单 TTL，窗口是计数而非重启），否则用进程内限流器，两条路径均**失败开放**。节点级计数跨账户失败达 100 次/窗口时**只告警不拦截**（全局拦截会让任何人停掉整个实例的登录）。`common/rate-limit.go` 为此新增 `Saturated` 与 `Reset`。测试：`service/login_attempt_limit_test.go`（新文件：内存与 miniredis 两条路径的耗尽/清零/TTL/失败开放、窗口内只告警一次）+ `controller/auth_flow_test.go` 的路由级用例（20 次错误口令后正确口令同样被拒、未知用户名同样被锁、其他名字不受影响）。
+- **④ 密码重置不回显新密码 —— 未修复（需产品决策）.** `controller/misc.go:296-318` 仍把生成的 12 位新密码放在 `data` 返回；前端 `web/src/features/auth/reset-password-confirm/index.tsx:75-85` 依赖该字段展示并复制密码。因此"删除回显"不是单侧改动，应改为校验重置令牌后由用户自设新密码（前后端联动），不在本轮小步修复范围内。
+- **其他残余**：验证码**发送**侧仍只有按 IP 的 2 次/30 秒限制（`middleware/email-verification-rate-limit.go`），分布式来源仍可对同一邮箱大量发送；按邮箱/按用户的发送限额未落地。登录计时的残留见 `6ec801848` 提交说明：滚动迁移算法期间占位 hash 跟随写入算法，旧格式账号仍可被区分。
 
 ### P0-4 明文 API Key 可凭会话直接读取，缺少二次验证 ✅
 
@@ -726,7 +735,7 @@ go test -coverpkg=.../middleware -cover -run 'TestResponsesWS|TestResponsesWebSo
 
 1. ~~P0-1 `/api/setup` 加一次性 setup token 或限制回环；顺带限制 `GET /api/setup`~~ 🛠️ 已修复（`91f20bae3`；`GET /api/setup` 有意保留开放，见该节残余风险）
 2. ~~P0-2 修正 MJ 路由中间件顺序 + 补归属校验~~ 🛠️ 已修复（`38ddfde30`；改为签名能力 URL，**不是**移动中间件顺序，原因见该节建议 1）
-3. P0-3 验证码恒定时间比较 + 失败作废 + 账户级限额；`TrustedProxies` 默认置空；登录 miss 路径跑一次 dummy argon2id；重置密码不回显
+3. P0-3 ~~验证码恒定时间比较 + 失败作废 + 账户级限额~~ 🛠️ 已修复（`927ab209e`、`826ee1357`）；~~登录 miss 路径跑一次 dummy argon2id~~ 🛠️ 已修复（`6ec801848`）；~~`TrustedProxies` 默认置空~~ 🚧 部分修复（`d3c953c7a`，**未改默认值**，改为把代价写进告警；残留见该节）；~~重置密码不回显~~ ❌ 未修复（需前后端联动，见该节 ④）
 4. P0-4 两个 token key 接口接入 step-up 验证
 5. P0-5 补齐 `c.Request.Context()`（含各渠道站点）
 6. P0-6 修正 `recover` 返回值与计费写入错误检查
