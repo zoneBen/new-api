@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/oauth"
 	"github.com/QuantumNous/new-api/service"
@@ -1122,4 +1123,63 @@ func TestOAuthBindIgnoresLegacyGitHubUsernames(t *testing.T) {
 			assert.Equal(t, "This GitHub account has already been bound", result.Message)
 		})
 	}
+}
+
+func TestSecurityLoginThrottlesFailedAttemptsPerAccount(t *testing.T) {
+	user, _ := setupSecurityEnrollmentTest(t)
+	previousPasswordLogin := common.PasswordLoginEnabled
+	common.PasswordLoginEnabled = true
+	t.Cleanup(func() { common.PasswordLoginEnabled = previousPasswordLogin })
+	unknown := "unknown-" + user.Username
+	t.Cleanup(func() {
+		service.ClearLoginAttempts(user.Username)
+		service.ClearLoginAttempts(unknown)
+	})
+
+	// attemptLogin posts a password login and returns the response together with
+	// the translation of expectedKey for the language the handler selected.
+	attemptLogin := func(username, password, expectedKey string) (bool, string, string) {
+		var body struct {
+			Success bool   `json:"success"`
+			Message string `json:"message"`
+		}
+		expected := ""
+		response := securityEnrollmentRequest("POST", "/api/user/login",
+			fmt.Sprintf(`{"username":%q,"password":%q}`, username, password), "", service.AuthIdentity{},
+			func(c *gin.Context) {
+				expected = i18n.T(c, expectedKey)
+				Login(c)
+			})
+		require.Equal(t, http.StatusOK, response.Code)
+		require.NoError(t, common.Unmarshal(response.Body.Bytes(), &body))
+		return body.Success, body.Message, expected
+	}
+
+	success, _, _ := attemptLogin(user.Username, "enrollment-password", i18n.MsgUserTooManyLoginAttempts)
+	require.True(t, success, "the fixture account must be able to log in before the throttle is exercised")
+
+	for range service.LoginAttemptFailureLimit {
+		success, message, expected := attemptLogin(user.Username, "wrong-password", i18n.MsgUserUsernameOrPasswordError)
+		require.False(t, success)
+		require.Equal(t, expected, message)
+	}
+
+	success, message, expected := attemptLogin(user.Username, "enrollment-password", i18n.MsgUserTooManyLoginAttempts)
+	assert.False(t, success, "the correct password must not bypass a spent budget")
+	assert.Equal(t, expected, message)
+
+	// The budget is charged to the submitted name, so an unknown name spends it
+	// the same way and cannot be probed for free.
+	for range service.LoginAttemptFailureLimit {
+		attemptLogin(unknown, "wrong-password", i18n.MsgUserUsernameOrPasswordError)
+	}
+	success, message, expected = attemptLogin(unknown, "wrong-password", i18n.MsgUserTooManyLoginAttempts)
+	assert.False(t, success)
+	assert.Equal(t, expected, message)
+
+	// A name that never failed is not affected by another account's spent budget.
+	success, message, expected = attemptLogin(user.Username+"-other", "wrong-password", i18n.MsgUserUsernameOrPasswordError)
+	assert.False(t, success)
+	assert.Equal(t, expected, message)
+	assert.NotEqual(t, i18n.Translate("en", i18n.MsgUserTooManyLoginAttempts), message)
 }

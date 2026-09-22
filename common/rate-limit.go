@@ -165,6 +165,41 @@ func (l *InMemoryRateLimiter) Request(key string, maxRequestNum int, duration in
 	return allowed
 }
 
+// Saturated reports whether key already reached maxRequestNum within duration,
+// without consuming a slot. Callers that check before an operation and record
+// afterwards use this to avoid charging for work that has not happened yet.
+func (l *InMemoryRateLimiter) Saturated(key string, maxRequestNum int, duration int64) bool {
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
+
+	entry, ok := l.store[key]
+	if !ok {
+		return false
+	}
+	now := time.Now()
+	entry.lastActive = now
+	l.lru.MoveToFront(entry.element)
+	entry.requests.removeExpired(now.Unix(), duration)
+	return entry.requests.length >= maxRequestNum
+}
+
+// Reset drops every recorded request for key.
+func (l *InMemoryRateLimiter) Reset(key string) {
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
+
+	entry, ok := l.store[key]
+	if !ok {
+		return
+	}
+	delete(l.store, key)
+	if entry.element != nil {
+		l.lru.Remove(entry.element)
+		entry.element = nil
+	}
+	entry.requests.clear()
+}
+
 // RateLimitReservation counts an active request towards admission until its
 // outcome is known. Failed requests release the slot without consuming quota.
 type RateLimitReservation struct {

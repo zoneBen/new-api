@@ -78,6 +78,13 @@ func Login(c *gin.Context) {
 		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
+	// Account-scoped throttle. It runs before the credential lookup and is charged
+	// to the submitted name, so a locked-out client learns nothing about whether
+	// the account exists, and the budget holds even when the client IP is forged.
+	if service.LoginAttemptsExhausted(username) {
+		common.ApiErrorI18n(c, i18n.MsgUserTooManyLoginAttempts)
+		return
+	}
 	user := model.User{
 		Username: username,
 		Password: password,
@@ -93,8 +100,14 @@ func Login(c *gin.Context) {
 		default:
 			common.ApiErrorI18n(c, i18n.MsgUserUsernameOrPasswordError)
 		}
+		// A database outage is not the caller's fault, so it must not spend the
+		// budget of an account that is merely unlucky.
+		if !errors.Is(err, model.ErrDatabase) {
+			service.RecordFailedLoginAttempt(username)
+		}
 		return
 	}
+	service.ClearLoginAttempts(username)
 
 	setupLogin(&user, nil, c)
 }

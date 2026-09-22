@@ -148,3 +148,46 @@ func TestInMemoryRateLimiterConcurrentInitializationAndRequests(t *testing.T) {
 	assert.Len(t, limiter.store, 1)
 	assert.Equal(t, 10, limiter.store["client"].requests.length)
 }
+
+func TestInMemoryRateLimiterSaturatedDoesNotConsumeSlots(t *testing.T) {
+	var limiter InMemoryRateLimiter
+	limiter.Init(0)
+
+	assert.False(t, limiter.Saturated("client", 2, 60), "an unknown key is not saturated")
+
+	require.True(t, limiter.Request("client", 2, 60))
+	require.True(t, limiter.Request("client", 2, 60))
+	assert.False(t, limiter.Request("client", 2, 60), "the window is full")
+
+	for range 3 {
+		assert.True(t, limiter.Saturated("client", 2, 60), "checking must not change the window")
+	}
+	require.NotNil(t, limiter.store["client"])
+	assert.Equal(t, 2, limiter.store["client"].requests.length)
+}
+
+func TestInMemoryRateLimiterSaturatedForgetsExpiredRequests(t *testing.T) {
+	var limiter InMemoryRateLimiter
+	limiter.Init(0)
+
+	require.True(t, limiter.Request("client", 1, 1))
+	assert.True(t, limiter.Saturated("client", 1, 1))
+
+	limiter.store["client"].requests.head.timestamp -= 10
+	assert.False(t, limiter.Saturated("client", 1, 1), "an expired request must free the slot")
+}
+
+func TestInMemoryRateLimiterResetDropsRecordedRequests(t *testing.T) {
+	var limiter InMemoryRateLimiter
+	limiter.Init(0)
+
+	require.True(t, limiter.Request("client", 1, 60))
+	require.True(t, limiter.Saturated("client", 1, 60))
+
+	limiter.Reset("client")
+
+	assert.False(t, limiter.Saturated("client", 1, 60))
+	assert.NotContains(t, limiter.store, "client")
+	assert.Zero(t, limiter.lru.Len())
+	assert.True(t, limiter.Request("client", 1, 60))
+}
