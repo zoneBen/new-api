@@ -42,10 +42,16 @@ func ValidateNewAccountPassword(password string) error {
 // temporary bcrypt mode permits rolling out dual-format readers to all nodes
 // before enabling Argon2id writes. Existing hashes are never rewritten in bulk.
 func HashAccountPassword(password string) (string, error) {
+	return hashAccountPassword(password, os.Getenv("ACCOUNT_PASSWORD_HASH_ALGORITHM"))
+}
+
+// hashAccountPassword takes the algorithm explicitly so callers that must not
+// depend on the process environment can still derive a well-formed hash.
+func hashAccountPassword(password string, algorithm string) (string, error) {
 	if err := ValidateNewAccountPassword(password); err != nil {
 		return "", err
 	}
-	switch os.Getenv("ACCOUNT_PASSWORD_HASH_ALGORITHM") {
+	switch algorithm {
 	case "bcrypt":
 		if len(password) > 72 {
 			return "", ErrPasswordLegacyLimit
