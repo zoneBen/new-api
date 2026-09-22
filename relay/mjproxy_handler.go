@@ -2,6 +2,7 @@ package relay
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -25,8 +26,22 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// RelayMidjourneyImage streams one forwarded Midjourney image.
+//
+// This route is registered before the group's TokenAuth middleware because the
+// dashboard renders it from a plain <img> tag, which cannot send the bearer
+// token. Authorization therefore comes from the capability query parameter:
+// the signature binds exactly one task ID, is issued only by endpoints that
+// already authenticated the caller, and is verified before any task lookup, so
+// an unauthenticated caller cannot enumerate other users' images by task ID.
 func RelayMidjourneyImage(c *gin.Context) {
 	taskId := c.Param("id")
+	if !service.VerifyMidjourneyImageAccess(c.Query(service.MidjourneyImageAccessQueryParameter), taskId) {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error": "midjourney_image_access_denied",
+		})
+		return
+	}
 	midjourneyTask := model.GetByOnlyMJId(taskId)
 	if midjourneyTask == nil {
 		c.JSON(400, gin.H{
@@ -149,9 +164,21 @@ func coverMidjourneyTaskDto(c *gin.Context, originTask *model.Midjourney) (midjo
 	midjourneyTask.FinishTime = originTask.FinishTime
 	midjourneyTask.ImageUrl = ""
 	if originTask.ImageUrl != "" && setting.MjForwardUrlEnabled {
-		midjourneyTask.ImageUrl = system_setting.ServerAddress + "/mj/image/" + originTask.MjId
-		if originTask.Status != "SUCCESS" {
-			midjourneyTask.ImageUrl += "?rand=" + strconv.FormatInt(time.Now().UnixNano(), 10)
+		forwardedImageUrl, err := service.BuildMidjourneyImageURL(originTask.MjId)
+		if err != nil {
+			// The proxy route rejects URLs without a capability, so publish the
+			// upstream URL instead of a proxy URL that could never be served.
+			logger.LogWarn(context.Background(), fmt.Sprintf(
+				"midjourney image forward URL unavailable, returning the upstream URL: mj_id=%s err=%v",
+				originTask.MjId,
+				err,
+			))
+			midjourneyTask.ImageUrl = originTask.ImageUrl
+		} else {
+			if originTask.Status != "SUCCESS" {
+				forwardedImageUrl += "&rand=" + strconv.FormatInt(time.Now().UnixNano(), 10)
+			}
+			midjourneyTask.ImageUrl = forwardedImageUrl
 		}
 	} else {
 		midjourneyTask.ImageUrl = originTask.ImageUrl

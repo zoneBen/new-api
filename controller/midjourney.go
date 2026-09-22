@@ -14,7 +14,6 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
-	"github.com/QuantumNous/new-api/setting/system_setting"
 
 	"github.com/gin-gonic/gin"
 )
@@ -278,6 +277,27 @@ func checkMjTaskNeedUpdate(oldTask *model.Midjourney, newTask dto.MidjourneyDto)
 	return false
 }
 
+// forwardMidjourneyImageURLs rewrites task image URLs to capability-bound proxy
+// URLs. A task whose capability cannot be issued keeps its upstream URL, because
+// the proxy route rejects URLs that carry no valid capability.
+func forwardMidjourneyImageURLs(items []*model.Midjourney) {
+	if !setting.MjForwardUrlEnabled {
+		return
+	}
+	for _, midjourney := range items {
+		forwardedImageUrl, err := service.BuildMidjourneyImageURL(midjourney.MjId)
+		if err != nil {
+			logger.LogWarn(context.Background(), fmt.Sprintf(
+				"midjourney image forward URL unavailable, returning the upstream URL: mj_id=%s err=%v",
+				midjourney.MjId,
+				err,
+			))
+			continue
+		}
+		midjourney.ImageUrl = forwardedImageUrl
+	}
+}
+
 func GetAllMidjourney(c *gin.Context) {
 	pageInfo := common.GetPageQuery(c)
 
@@ -292,12 +312,7 @@ func GetAllMidjourney(c *gin.Context) {
 	items := model.GetAllTasks(pageInfo.GetStartIdx(), pageInfo.GetPageSize(), queryParams)
 	total := model.CountAllTasks(queryParams)
 
-	if setting.MjForwardUrlEnabled {
-		for i, midjourney := range items {
-			midjourney.ImageUrl = system_setting.ServerAddress + "/mj/image/" + midjourney.MjId
-			items[i] = midjourney
-		}
-	}
+	forwardMidjourneyImageURLs(items)
 	pageInfo.SetTotal(int(total))
 	pageInfo.SetItems(items)
 	common.ApiSuccess(c, pageInfo)
@@ -317,12 +332,7 @@ func GetUserMidjourney(c *gin.Context) {
 	items := model.GetAllUserTask(userId, pageInfo.GetStartIdx(), pageInfo.GetPageSize(), queryParams)
 	total := model.CountAllUserTask(userId, queryParams)
 
-	if setting.MjForwardUrlEnabled {
-		for i, midjourney := range items {
-			midjourney.ImageUrl = system_setting.ServerAddress + "/mj/image/" + midjourney.MjId
-			items[i] = midjourney
-		}
-	}
+	forwardMidjourneyImageURLs(items)
 	pageInfo.SetTotal(int(total))
 	pageInfo.SetItems(items)
 	common.ApiSuccess(c, pageInfo)

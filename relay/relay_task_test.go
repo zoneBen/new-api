@@ -17,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/config"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
@@ -466,4 +467,59 @@ export function parseTaskResult() { return {status:"SUCCESS"}; }
 			assert.JSONEq(t, `{"status":`+strconv.Itoa(tc.status)+`}`, string(result.TaskData))
 		})
 	}
+}
+
+func TestRelayMidjourneyImageServesOnlyCapabilityBoundTask(t *testing.T) {
+	database := setupRelayChannelDB(t)
+	require.NoError(t, database.AutoMigrate(&model.Midjourney{}))
+
+	previousSecret := common.CryptoSecret
+	common.CryptoSecret = "relay-midjourney-image-test-secret"
+	t.Cleanup(func() { common.CryptoSecret = previousSecret })
+
+	upstreamHits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits++
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write([]byte("image-bytes"))
+	}))
+	t.Cleanup(upstream.Close)
+
+	fetchSetting := system_setting.GetFetchSetting()
+	previousFetchSetting := *fetchSetting
+	fetchSetting.EnableSSRFProtection = true
+	fetchSetting.AllowPrivateIp = true
+	fetchSetting.AllowedPorts = nil
+	t.Cleanup(func() { *system_setting.GetFetchSetting() = previousFetchSetting })
+	service.InitHttpClient()
+
+	require.NoError(t, database.Create(&model.Midjourney{
+		UserId:   7,
+		MjId:     "mj-1",
+		Status:   "SUCCESS",
+		ImageUrl: upstream.URL + "/mj-1.png",
+	}).Error)
+
+	router := gin.New()
+	router.GET("/mj/image/:id", RelayMidjourneyImage)
+	call := func(target string) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, target, nil))
+		return recorder
+	}
+
+	require.Equal(t, http.StatusForbidden, call("/mj/image/mj-1").Code)
+	otherTaskAccess, err := service.IssueMidjourneyImageAccess("mj-2")
+	require.NoError(t, err)
+	require.Equal(t, http.StatusForbidden, call("/mj/image/mj-1?access="+otherTaskAccess).Code)
+	assert.Equal(t, http.StatusForbidden, call("/mj/image/mj-1?access=tampered-capability").Code)
+	assert.Zero(t, upstreamHits, "a rejected request must not fetch the upstream image")
+
+	access, err := service.IssueMidjourneyImageAccess("mj-1")
+	require.NoError(t, err)
+	response := call("/mj/image/mj-1?access=" + access)
+	require.Equal(t, http.StatusOK, response.Code)
+	assert.Equal(t, "image-bytes", response.Body.String())
+	assert.Equal(t, "image/png", response.Header().Get("Content-Type"))
+	assert.Equal(t, 1, upstreamHits)
 }
