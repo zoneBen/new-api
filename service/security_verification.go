@@ -21,6 +21,7 @@ const (
 	VerificationMethodOAuth              = "oauth"
 	VerificationMethodSession            = "session"
 	VerificationScopeChannelKeyRead      = "channel.key.read"
+	VerificationScopeTokenKeyRead        = "token.key.read"
 	VerificationScopePasskeyRegister     = "passkey.register"
 	VerificationScopePasskeyDelete       = "passkey.delete"
 	VerificationScopeTwoFASetup          = "2fa.setup"
@@ -54,6 +55,51 @@ type VerificationOperation struct {
 
 type ChannelKeyReadContext struct {
 	ChannelID int `json:"channel_id"`
+}
+
+type TokenKeyReadContext struct {
+	TokenIDs []int `json:"token_ids"`
+}
+
+// maxTokenKeyReadIDs keeps one proof within the batch endpoint's own limit.
+const maxTokenKeyReadIDs = 100
+
+// normalizeTokenKeyReadIDs sorts and deduplicates the ids so a proof covers
+// exactly the set of tokens it was issued for, whatever order the caller listed
+// them in, and reports false when the set cannot form a proof context.
+func normalizeTokenKeyReadIDs(tokenIDs []int) ([]int, bool) {
+	if len(tokenIDs) == 0 || len(tokenIDs) > maxTokenKeyReadIDs {
+		return nil, false
+	}
+	seen := make(map[int]struct{}, len(tokenIDs))
+	normalized := make([]int, 0, len(tokenIDs))
+	for _, id := range tokenIDs {
+		if id <= 0 {
+			return nil, false
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		normalized = append(normalized, id)
+	}
+	sort.Ints(normalized)
+	return normalized, true
+}
+
+// NewTokenKeyReadOperation binds a key disclosure to the exact token ids it may
+// disclose. The binding is what stops a proof for one token from being replayed
+// to read another, so callers must pass the ids they are about to return.
+func NewTokenKeyReadOperation(tokenIDs []int) (VerificationOperation, bool) {
+	normalized, ok := normalizeTokenKeyReadIDs(tokenIDs)
+	if !ok {
+		return VerificationOperation{}, false
+	}
+	context, err := common.Marshal(TokenKeyReadContext{TokenIDs: normalized})
+	if err != nil {
+		return VerificationOperation{}, false
+	}
+	return VerificationOperation{Scope: VerificationScopeTokenKeyRead, Context: context}, true
 }
 
 type AccountBindingContext struct {
@@ -110,6 +156,17 @@ func BindVerificationOperation(operation VerificationOperation) (VerificationBin
 				return VerificationBinding{}, ErrVerificationContextInvalid
 			}
 		}
+		normalized = context
+	case VerificationScopeTokenKeyRead:
+		var context TokenKeyReadContext
+		if len(fields) != 1 || common.Unmarshal(fields["token_ids"], &context.TokenIDs) != nil {
+			return VerificationBinding{}, ErrVerificationContextInvalid
+		}
+		tokenIDs, ok := normalizeTokenKeyReadIDs(context.TokenIDs)
+		if !ok {
+			return VerificationBinding{}, ErrVerificationContextInvalid
+		}
+		context.TokenIDs = tokenIDs
 		normalized = context
 	case VerificationScopeAccountUnbind:
 		var context AccountUnbindingContext
@@ -186,7 +243,8 @@ func securityVerificationPolicy(scope string, state model.UserVerificationState)
 	case VerificationScopePasskeyRegister, VerificationScopeTwoFASetup,
 		VerificationScopeAccessTokenGenerate, VerificationScopeAccessTokenRevoke,
 		VerificationScopeAccountBind, VerificationScopeAccountUnbind,
-		VerificationScopePasswordSet, VerificationScopePasswordChange, VerificationScopeAccountDelete:
+		VerificationScopePasswordSet, VerificationScopePasswordChange, VerificationScopeAccountDelete,
+		VerificationScopeTokenKeyRead:
 		if scope == VerificationScopeAccountDelete && state.Role == common.RoleRootUser {
 			return nil, ErrVerificationForbidden
 		}

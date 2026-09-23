@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/i18n"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
@@ -17,6 +18,20 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/shopspring/decimal"
 )
+
+// requireTokenKeyReadProof gates a key disclosure behind a one-use step-up proof
+// bound to the exact token ids being disclosed. A relay key is a bearer
+// credential for the account's quota, so a stolen dashboard session must not be
+// able to export it on its own, and a proof for one token must not be replayable
+// to read another.
+func requireTokenKeyReadProof(c *gin.Context, tokenIDs []int) bool {
+	operation, ok := service.NewTokenKeyReadOperation(tokenIDs)
+	if !ok {
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+		return false
+	}
+	return middleware.RequireSecurityProof(c, operation) != nil
+}
 
 type tokenAutoGroupsInput struct {
 	Set    bool
@@ -190,6 +205,9 @@ func GetTokenKey(c *gin.Context) {
 	userId := c.GetInt("id")
 	if err != nil {
 		common.ApiError(c, err)
+		return
+	}
+	if !requireTokenKeyReadProof(c, []int{id}) {
 		return
 	}
 	token, err := model.GetTokenByIds(id, userId)
@@ -531,6 +549,9 @@ func GetTokenKeysBatch(c *gin.Context) {
 	}
 	if len(tokenBatch.Ids) > 100 {
 		common.ApiErrorI18n(c, i18n.MsgBatchTooMany, map[string]any{"Max": 100})
+		return
+	}
+	if !requireTokenKeyReadProof(c, tokenBatch.Ids) {
 		return
 	}
 	userId := c.GetInt("id")

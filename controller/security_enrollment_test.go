@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1639,4 +1640,109 @@ func TestSecurityEnrollmentRejectsChangedFirstFactorPolicy(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestSecurityEnrollmentTokenKeyReadRequiresBoundProof(t *testing.T) {
+	user, identity := setupSecurityEnrollmentTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Token{}))
+	// Batch key disclosure selects the key column through the production column
+	// quoting, which the database bootstrap initializes; this fixture replaces the
+	// bootstrap, so initialize it here instead of querying with an empty column.
+	previousMasterNode := common.IsMasterNode
+	common.IsMasterNode = false
+	t.Cleanup(func() { common.IsMasterNode = previousMasterNode })
+	require.NoError(t, model.InitLogDB())
+	newToken := func(ownerID int, name, key string) *model.Token {
+		return &model.Token{UserId: ownerID, Name: name, Key: key, Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 100, UnlimitedQuota: true, Group: "default"}
+	}
+	first, second := newToken(user.Id, "first", "first-token-secret"), newToken(user.Id, "second", "second-token-secret")
+	foreign := newToken(user.Id+1, "foreign", "foreign-token-secret")
+	require.NoError(t, model.DB.Create(first).Error)
+	require.NoError(t, model.DB.Create(second).Error)
+	require.NoError(t, model.DB.Create(foreign).Error)
+
+	requirements := securityEnrollmentRequest("GET", "/api/verify/methods?scope="+service.VerificationScopeTokenKeyRead, "", "", identity, GetVerificationMethods)
+	var requirementBody struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Methods []struct {
+				Method string `json:"method"`
+			} `json:"methods"`
+		} `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(requirements.Body.Bytes(), &requirementBody))
+	require.True(t, requirementBody.Success, requirements.Body.String())
+	require.Len(t, requirementBody.Data.Methods, 1)
+	assert.Equal(t, service.VerificationMethodPassword, requirementBody.Data.Methods[0].Method, "a user without a second factor still reveals their own key")
+
+	operation := func(tokenIDs ...int) service.VerificationOperation {
+		bound, ok := service.NewTokenKeyReadOperation(tokenIDs)
+		require.True(t, ok)
+		return bound
+	}
+	readKey := func(tokenID int, proof string) (int, securityEnrollmentResponse) {
+		response := securityEnrollmentRequest("POST", "/api/token/1/key", "", proof, identity, func(c *gin.Context) {
+			c.Params = gin.Params{{Key: "id", Value: strconv.Itoa(tokenID)}}
+			GetTokenKey(c)
+		})
+		var body securityEnrollmentResponse
+		require.NoError(t, common.Unmarshal(response.Body.Bytes(), &body))
+		return response.Code, body
+	}
+	readKeys := func(ids []int, proof string) (int, securityEnrollmentResponse) {
+		payload, err := common.Marshal(map[string]any{"ids": ids})
+		require.NoError(t, err)
+		response := securityEnrollmentRequest("POST", "/api/token/batch/keys", string(payload), proof, identity, GetTokenKeysBatch)
+		var body securityEnrollmentResponse
+		require.NoError(t, common.Unmarshal(response.Body.Bytes(), &body))
+		return response.Code, body
+	}
+
+	for _, test := range []struct {
+		name string
+		read func() (int, securityEnrollmentResponse)
+	}{
+		{"single key", func() (int, securityEnrollmentResponse) { return readKey(first.Id, "") }},
+		{"batch keys", func() (int, securityEnrollmentResponse) { return readKeys([]int{first.Id, second.Id}, "") }},
+	} {
+		t.Run(test.name+" without proof", func(t *testing.T) {
+			status, body := test.read()
+			assert.Equal(t, http.StatusForbidden, status)
+			assert.False(t, body.Success)
+			assert.Equal(t, "SECURITY_PROOF_REQUIRED", body.Code)
+			assert.NotContains(t, string(body.Data), "token-secret")
+		})
+	}
+
+	authorized := issueSecurityEnrollmentProof(t, identity, operation(first.Id), service.VerificationMethodPassword)
+	status, body := readKey(first.Id, authorized)
+	assert.Equal(t, http.StatusOK, status, body.Message)
+	require.True(t, body.Success, body.Message)
+	assert.Contains(t, string(body.Data), "first-token-secret")
+
+	status, body = readKey(first.Id, authorized)
+	assert.Equal(t, http.StatusForbidden, status, "a proof is one use only")
+	assert.Equal(t, "SECURITY_PROOF_CONSUMED", body.Code)
+
+	status, body = readKey(second.Id, issueSecurityEnrollmentProof(t, identity, operation(first.Id), service.VerificationMethodPassword))
+	assert.Equal(t, http.StatusForbidden, status, "a proof for one token must not disclose another")
+	assert.Equal(t, "SECURITY_PROOF_CONTEXT_MISMATCH", body.Code)
+	assert.NotContains(t, string(body.Data), "second-token-secret")
+
+	status, body = readKeys([]int{first.Id, second.Id}, issueSecurityEnrollmentProof(t, identity, operation(first.Id), service.VerificationMethodPassword))
+	assert.Equal(t, http.StatusForbidden, status, "a batch must not widen a single-token proof")
+	assert.Equal(t, "SECURITY_PROOF_CONTEXT_MISMATCH", body.Code)
+
+	status, body = readKeys([]int{second.Id, first.Id}, issueSecurityEnrollmentProof(t, identity, operation(first.Id, second.Id), service.VerificationMethodPassword))
+	assert.Equal(t, http.StatusOK, status, body.Message)
+	require.True(t, body.Success, body.Message)
+	assert.Contains(t, string(body.Data), "first-token-secret")
+	assert.Contains(t, string(body.Data), "second-token-secret", "the bound set is order independent")
+
+	// A valid proof discloses nothing it does not own: the proof binds ids, the
+	// query still filters by the authenticated user.
+	status, body = readKey(foreign.Id, issueSecurityEnrollmentProof(t, identity, operation(foreign.Id), service.VerificationMethodPassword))
+	assert.Equal(t, http.StatusOK, status)
+	assert.False(t, body.Success, "another account's token stays unreadable")
+	assert.NotContains(t, string(body.Data), "foreign-token-secret")
 }

@@ -30,6 +30,7 @@ import (
 type tokenAPIResponse struct {
 	Success bool            `json:"success"`
 	Message string          `json:"message"`
+	Code    string          `json:"code"`
 	Data    json.RawMessage `json:"data"`
 }
 
@@ -551,37 +552,29 @@ func TestUpdateTokenMasksKeyInResponse(t *testing.T) {
 	}
 }
 
-func TestGetTokenKeyRequiresOwnershipAndReturnsFullKey(t *testing.T) {
+func TestGetTokenKeyRequiresStepUpProof(t *testing.T) {
 	db := setupTokenControllerTestDB(t)
 	token := seedToken(t, db, 1, "owned-token", "owner1234token5678")
 
-	authorizedCtx, authorizedRecorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/"+strconv.Itoa(token.Id)+"/key", nil, 1)
-	authorizedCtx.Params = gin.Params{{Key: "id", Value: strconv.Itoa(token.Id)}}
-	GetTokenKey(authorizedCtx)
+	// Without a session-scoped step-up proof the handler refuses before it reads the
+	// token, so neither the owner nor a stranger learns the key. The authorized and
+	// ownership-checked paths are covered by
+	// TestSecurityEnrollmentTokenKeyReadRequiresBoundProof.
+	for _, userID := range []int{1, 2} {
+		ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/"+strconv.Itoa(token.Id)+"/key", nil, userID)
+		ctx.Params = gin.Params{{Key: "id", Value: strconv.Itoa(token.Id)}}
+		GetTokenKey(ctx)
 
-	authorizedResponse := decodeAPIResponse(t, authorizedRecorder)
-	if !authorizedResponse.Success {
-		t.Fatalf("expected authorized key fetch to succeed, got message: %s", authorizedResponse.Message)
-	}
-
-	var keyData tokenKeyResponse
-	if err := common.Unmarshal(authorizedResponse.Data, &keyData); err != nil {
-		t.Fatalf("failed to decode token key response: %v", err)
-	}
-	if keyData.Key != token.GetFullKey() {
-		t.Fatalf("expected full key %q, got %q", token.GetFullKey(), keyData.Key)
-	}
-
-	unauthorizedCtx, unauthorizedRecorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/"+strconv.Itoa(token.Id)+"/key", nil, 2)
-	unauthorizedCtx.Params = gin.Params{{Key: "id", Value: strconv.Itoa(token.Id)}}
-	GetTokenKey(unauthorizedCtx)
-
-	unauthorizedResponse := decodeAPIResponse(t, unauthorizedRecorder)
-	if unauthorizedResponse.Success {
-		t.Fatalf("expected unauthorized key fetch to fail")
-	}
-	if strings.Contains(unauthorizedRecorder.Body.String(), token.Key) {
-		t.Fatalf("unauthorized key response leaked raw token key: %s", unauthorizedRecorder.Body.String())
+		response := decodeAPIResponse(t, recorder)
+		if response.Success {
+			t.Fatalf("user %d: expected key fetch without a proof to fail", userID)
+		}
+		if response.Code != "SECURITY_PROOF_INVALID" {
+			t.Fatalf("user %d: expected an invalid-proof error, got %q", userID, response.Code)
+		}
+		if strings.Contains(recorder.Body.String(), token.Key) {
+			t.Fatalf("user %d: refused key response leaked raw token key: %s", userID, recorder.Body.String())
+		}
 	}
 }
 
@@ -614,7 +607,9 @@ func TestAPITokenAuditDatabaseMatrix(t *testing.T) {
 				db, _ := newAuditTestDatabase(t, database.name, dsn)
 				model.DB = db
 				common.SetDatabaseTypes(database.typ, database.typ)
-				require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.Token{}))
+				// The second-factor tables back the verification state that every
+				// step-up proof is validated against.
+				require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.Token{}, &model.AuthFlow{}, &model.TwoFA{}, &model.PasskeyCredential{}))
 				// Initialize production column quoting as well as the existing audit table.
 				require.NoError(t, model.InitLogDB())
 				if separateLog {
@@ -649,7 +644,8 @@ func verifyAPITokenAudit(t *testing.T) {
 	require.NoError(t, model.DB.Create(other).Error)
 	session := &model.UserSession{SID: "token-audit-session", UserID: user.Id, Version: 1, UserAuthVersion: 1, Status: model.UserSessionStatusActive, RefreshHash: "placeholder", LoginMethod: "password", LastActiveAt: time.Now().Unix(), ExpiresAt: time.Now().Add(time.Hour).Unix()}
 	require.NoError(t, model.CreateUserSession(session))
-	jwt, _, err := service.IssueAccessToken(service.AuthIdentity{UserID: user.Id, SessionID: session.SID, UserAuthVersion: 1, SessionVersion: 1})
+	identity := service.AuthIdentity{UserID: user.Id, SessionID: session.SID, UserAuthVersion: 1, SessionVersion: 1}
+	jwt, _, err := service.IssueAccessToken(identity)
 	require.NoError(t, err)
 	router := gin.New()
 	router.Use(middleware.RequestId(), middleware.AccessTokenAudit())
@@ -676,7 +672,13 @@ func verifyAPITokenAudit(t *testing.T) {
 		success                          bool
 		params                           string
 		initialStatus                    int
-		failWrite, rateLimit, usePAT     bool
+		// proofIDs lists the token ids a step-up proof is minted for, resolved from
+		// $id/$other like the path and body templates. Key disclosure demands a proof
+		// bound to the exact ids, so the success paths have to ask for one.
+		proofIDs                     string
+		status                       int
+		code                         string
+		failWrite, rateLimit, usePAT bool
 	}{
 		{name: "create", method: "POST", path: "/", body: `{"name":"created","expired_time":-1,"unlimited_quota":true}`, action: "token.create", success: true},
 		{name: "invalid create", method: "POST", path: "/", body: `{"name":"attempt","remain_quota":-1}`, action: "token.create", params: `{"name":"attempt"}`},
@@ -695,14 +697,16 @@ func verifyAPITokenAudit(t *testing.T) {
 		{name: "delete", method: "DELETE", path: "/$id", action: "token.delete", success: true, params: `{"id":$id,"name":"owned"}`},
 		{name: "foreign delete", method: "DELETE", path: "/$other", action: "token.delete", params: `{"id":$other}`},
 		{name: "missing delete", method: "DELETE", path: "/999999", action: "token.delete", params: `{"id":999999}`},
-		{name: "key view", method: "POST", path: "/$id/key", action: "token.key_view", success: true, params: `{"id":$id,"name":"owned"}`},
-		{name: "PAT key view", method: "POST", path: "/$id/key", action: "token.key_view", success: true, params: `{"id":$id,"name":"owned"}`, usePAT: true},
-		{name: "foreign key view", method: "POST", path: "/$other/key", action: "token.key_view", params: `{"id":$other}`},
+		{name: "key view", method: "POST", path: "/$id/key", action: "token.key_view", success: true, params: `{"id":$id,"name":"owned"}`, proofIDs: "$id"},
+		// A personal access token can never carry a session-scoped step-up proof, so
+		// key disclosure is refused before the token is even looked up.
+		{name: "PAT key view", method: "POST", path: "/$id/key", action: "token.key_view", params: `{"id":$id}`, usePAT: true, status: 403, code: "SECURITY_PROOF_INVALID"},
+		{name: "foreign key view", method: "POST", path: "/$other/key", action: "token.key_view", params: `{"id":$other}`, proofIDs: "$other"},
 		{name: "rate limited key view", method: "POST", path: "/$id/key", action: "token.key_view", params: `{"id":$id}`, rateLimit: true},
 		{name: "batch delete partial and duplicate", method: "POST", path: "/batch", body: `{"ids":[$id,$id,$other,999999]}`, action: "token.delete_batch", success: true, params: `{"requested_ids":[$id,$id,$other,999999],"total":4,"count":1}`},
 		{name: "empty batch delete", method: "POST", path: "/batch", body: `{"ids":[]}`, action: "token.delete_batch", params: `{"requested_ids":[],"total":0}`},
-		{name: "batch keys partial and duplicate", method: "POST", path: "/batch/keys", body: `{"ids":[$id,$id,$other,999999]}`, action: "token.key_view_batch", success: true, params: `{"requested_ids":[$id,$id,$other,999999],"total":4,"count":1,"returned_ids":[$id]}`},
-		{name: "batch keys no matches", method: "POST", path: "/batch/keys", body: `{"ids":[$other,999999]}`, action: "token.key_view_batch", success: true, params: `{"requested_ids":[$other,999999],"total":2,"count":0,"returned_ids":[]}`},
+		{name: "batch keys partial and duplicate", method: "POST", path: "/batch/keys", body: `{"ids":[$id,$id,$other,999999]}`, action: "token.key_view_batch", success: true, params: `{"requested_ids":[$id,$id,$other,999999],"total":4,"count":1,"returned_ids":[$id]}`, proofIDs: "$id,$other,999999"},
+		{name: "batch keys no matches", method: "POST", path: "/batch/keys", body: `{"ids":[$other,999999]}`, action: "token.key_view_batch", success: true, params: `{"requested_ids":[$other,999999],"total":2,"count":0,"returned_ids":[]}`, proofIDs: "$other,999999"},
 		{name: "empty batch keys", method: "POST", path: "/batch/keys", body: `{"ids":[]}`, action: "token.key_view_batch", params: `{"requested_ids":[],"total":0}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -741,6 +745,21 @@ func verifyAPITokenAudit(t *testing.T) {
 			request.Header.Set("Content-Type", "application/json")
 			request.Header.Set("User-Agent", "api-token-audit-client")
 			request.RemoteAddr = "192.0.2.12:4321"
+			if tc.proofIDs != "" {
+				ids := make([]int, 0, 4)
+				for _, raw := range strings.Split(replace.Replace(tc.proofIDs), ",") {
+					id, convErr := strconv.Atoi(raw)
+					require.NoError(t, convErr)
+					ids = append(ids, id)
+				}
+				operation, ok := service.NewTokenKeyReadOperation(ids)
+				require.True(t, ok)
+				binding, bindErr := service.BindVerificationOperation(operation)
+				require.NoError(t, bindErr)
+				proof, _, proofErr := service.IssueSecurityProof(identity, service.VerificationMethodPassword, binding)
+				require.NoError(t, proofErr)
+				request.Header.Set("X-Security-Proof", proof)
+			}
 			if tc.rateLimit {
 				request.Header.Set("X-Test-Limit", "1")
 			}
@@ -770,10 +789,18 @@ func verifyAPITokenAudit(t *testing.T) {
 			assert.Equal(t, tc.action, operation.Action)
 			assert.Equal(t, tc.success, operation.Success)
 			assert.Equal(t, response.Code, operation.Status)
+			expectedStatus := 200
 			if tc.rateLimit {
-				assert.Equal(t, 429, response.Code)
-			} else {
-				assert.Equal(t, 200, response.Code)
+				expectedStatus = 429
+			}
+			if tc.status != 0 {
+				expectedStatus = tc.status
+			}
+			assert.Equal(t, expectedStatus, response.Code)
+			if tc.code != "" {
+				assert.Equal(t, tc.code, decodeAPIResponse(t, response).Code)
+			}
+			if !tc.rateLimit {
 				assert.Equal(t, tc.success, decodeAPIResponse(t, response).Success)
 			}
 			assert.Equal(t, user.Id, operation.UserId)
