@@ -113,6 +113,7 @@
 | P0-2 MJ 图片代理越权读取 | 🛠️ 已修复 | `38ddfde30` | `go build ./...`、`go vet`、`go test ./relay/ ./service/ ./controller/` 通过；路由级用例覆盖无签名/篡改/他人任务签名被拒且不触达上游，正确签名返回 200 + `image/png` |
 | P0-3 验证码与登录缺乏账户级限制 | 🚧 部分修复 | `927ab209e` 验证码<br>`6ec801848` 登录计时<br>`d3c953c7a` 代理告警<br>`826ee1357` 账户锁定 | `go build ./...`、`go vet ./...`、`go test ./controller/ ./service/ ./common/` 通过；`go test -race` 覆盖新增用例。剩余：`TRUSTED_PROXIES` 失败关闭（默认值未改，代价已写入告警与 `.env.example`）、验证码发送侧按邮箱限额、重置密码回显（需前后端联动） |
 | P0-4 明文 API Key 可凭会话直接读取 | 🛠️ 已修复 | `c62f10985` 后端<br>`5447458ce` 前端 | `go test ./controller/ -count=1` 通过（243s）、`npx vitest run` 165 文件 / 2094 用例通过。两个接口均接入 `token.key.read` step-up，证明绑定 id 集合（排序去重、上限 100），限流改按用户。行为变更：**PAT 读 key 变 403**、聊天页与仪表盘新增验证弹窗 |
+| P0-5 上游请求丢失客户端 context | 🛠️ 已修复 | `426a65d0a` | `go build ./...`、`go vet ./relay/...`、`go test ./relay/... -count=1`（18 包 ok）、`go test ./service/ -count=1` 通过；新用例 `-race` 通过且已验证"未绑定即失败"。两个入口 + 5 个自建请求的渠道站点 + MJ 提交改为绑定客户端 context；残余：ollama/baidu/jsplugin helper 与部分非中继调用方（见该节） |
 
 ---
 
@@ -235,6 +236,15 @@ Gin 的 `Use` 只作用于其后注册的路由，因此 `/mj/image/:id` 与 `/:
 **影响.** 客户端放弃请求后，上游连接与 goroutine 继续占用，预扣额度不会回滚——即"为已放弃的请求付费"。
 
 **建议.** 在 `doRequest` 内补 `req = req.WithContext(c.Request.Context())`，并逐个修正上列渠道站点；可加一条单测或 lint 规则防止回归。
+
+**🛠️ 已修复（`426a65d0a`）.** 采用**在构造点绑定**而非在 `doRequest` 内统一改写：`doRequest` 同时被 `DoTaskApiRequest`（其 `newTaskAPIRequest` 已正确绑定）和外部 `DoRequest` 使用，在传输层静默替换调用方自设的 context 会让"调用方明确指定 context"这一语义失效；构造点绑定与仓库既有的正确写法一致。
+- **入口.** `DoApiRequest` / `DoFormRequest`（几乎所有 HTTP 渠道适配器的必经之路）改用 `http.NewRequestWithContext(c.Request.Context(), ...)`。文档原建议中的 `:562 relayClient.Do(req)` **无需改动**——请求一旦携带客户端 context，`Do` 自然随客户端断开而取消。
+- **自建请求的渠道站点.** `jimeng/adaptor.go`（经 `channel.DoRequest`）、`coze/relay-coze.go` 两处（chat retrieve 与 message list）、`dify/relay-dify.go`（文件上传）、`replicate/adaptor.go`（文件上传）。
+- **额外发现并修复：`service/midjourney.go:341`.** MJ 提交此前用 `context.WithTimeout(context.Background(), timeout)`：超时本身有上界，但客户端断开后仍会跑满超时。改为 `context.WithTimeout(c.Request.Context(), timeout)`，超时与取消语义都保留。文档原证据列表未列出该处。
+- **测试.** `relay/channel/api_request_test.go` 新增 `TestDoRequestEntryPointsInheritClientCancellation`：对 `DoApiRequest` 与 `DoFormRequest` 各起一个 httptest 上游，handler 先排空请求体（**net/http 只有在请求体被消费后才启动后台读**，否则服务端察觉不到客户端断开——这是本用例第一次写成时踩到的坑），再阻塞在 `r.Context().Done()` 上；只有真实取消才会回报，因此不会因为"服务端自己放弃"而误过。随后取消客户端 context，断言上游请求被取消且中继调用返回错误。**已确认未绑定版本会在 5 秒守卫处失败（红），绑定后通过（绿）。**
+- **验证.** `go build ./...`、`go vet ./relay/...`、`go test ./relay/... -count=1`（18 个包全 ok）、`go test ./service/ -count=1`（ok）、新用例 `-race` 通过。
+
+**残余（本轮未修）.** ① **ollama 的 5 处**（模型列表/拉取/流式拉取/删除/版本）、**baidu 的 access token 获取**、**task-plugin 的描述符请求**未绑定：前者的调用方既包含 `controller/channel.go` 的请求处理（有 `c`），也包含 `controller/channel_upstream_update.go` 的后台模型同步（无 `c`）；baidu 的 helper 藏在带缓存的共享函数后；jsplugin 的 `doFetchDescriptor` 由后台任务轮询调用。绑定它们需要逐个改签名并决定后台调用方用什么 context，属独立改动。② **非中继路径**的同类写法仍在：`controller/channel-billing.go:153,444`、`controller/channel_upstream_update.go:337`、`controller/wechat.go:31`、`controller/topup_creem.go:420`、`service/user_notify.go:161,254`、`service/webhook.go:95`（部分调用方本身没有客户端请求）。③ `RELAY_TIMEOUT` 默认为 0，出站客户端**没有超时**，因此上述任何丢失客户端 context 的路径只受 TCP keepalive 约束；为这些路径补超时预算是遗留项。
 
 ### P0-6 `recover` 把 panic 转成"成功"，计费写入被静默忽略 ✅
 
@@ -750,7 +760,7 @@ go test -coverpkg=.../middleware -cover -run 'TestResponsesWS|TestResponsesWebSo
 2. ~~P0-2 修正 MJ 路由中间件顺序 + 补归属校验~~ 🛠️ 已修复（`38ddfde30`；改为签名能力 URL，**不是**移动中间件顺序，原因见该节建议 1）
 3. P0-3 ~~验证码恒定时间比较 + 失败作废 + 账户级限额~~ 🛠️ 已修复（`927ab209e`、`826ee1357`）；~~登录 miss 路径跑一次 dummy argon2id~~ 🛠️ 已修复（`6ec801848`）；~~`TrustedProxies` 默认置空~~ 🚧 部分修复（`d3c953c7a`，**未改默认值**，改为把代价写进告警；残留见该节）；~~重置密码不回显~~ ❌ 未修复（需前后端联动，见该节 ④）
 4. ~~P0-4 两个 token key 接口接入 step-up 验证~~ 🛠️ 已修复（`c62f10985`、`5447458ce`；按"两个接口都加"执行，证明绑定 id 集合、限流改按用户；**PAT 读 key 变为 403**、聊天页与仪表盘新增验证弹窗，见该节）
-5. P0-5 补齐 `c.Request.Context()`（含各渠道站点）
+5. ~~P0-5 补齐 `c.Request.Context()`（含各渠道站点）~~ 🛠️ 已修复（`426a65d0a`；在构造点绑定而非改写 `doRequest`，额外发现并修复 MJ 提交的 `context.Background()` 超时；ollama/baidu/jsplugin helper 与部分非中继调用方见该节残余）
 6. P0-6 修正 `recover` 返回值与计费写入错误检查
 7. P0-7 与维护者确认任务分组倍率参数；统一 `gpt-image-1` 默认质量
 8. P0-8 移除 zhipu 密钥明文日志；日志脱敏改为按参数名白名单（`key`/`api_key`/`token`/`secret`）
