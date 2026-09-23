@@ -284,7 +284,7 @@ panic 后函数返回零值 `nil`，调用方认为路由能力表已重建。�
 - **测试.** `model/task_persist_test.go`（写入成功 / CAS 落空 / 写失败 / 无变化不发 UPDATE 四例，后三例同时断言内存 task 已回到快照）、`model/usedata_save_test.go`（查询失败不再插入重复行）、`model/invite_rewards_test.go`（写失败时**零审计记录**，写成功后两笔奖励与两条日志都在；未确认合规条款时不发放）。**五条用例均确认过去掉修复即失败（红）**：例如去掉 `Restore` 时 `Status=SUCCESS` 残留在内存对象上、去掉查询错误检查时 `quota_data` 出现 2 行、去掉日志门控时出现 2 条虚假赠送记录。
 - **验证.** `go build ./...`、`go vet ./model/ ./relay/ ./service/`、`go test ./... -count=1` 全绿。
 
-**残余（本轮未修）.** ① `tryRealtimeFetch` 的调用点本身只有间接覆盖：驱动它需要 Gemini/Vertex 的 task plugin 与假上游，因此判定逻辑放在 model 包内直接测试，中继侧只保留"失败即放弃刷新"的薄分支。② `quota_data` 刷写失败的条目**仍随缓存一起丢弃**（保留下来会在数据库故障期间无界占用内存），本轮把它从"静默丢失"改为"显式上报 + 计数"，真正的重试/落盘缓冲是后续项。③ 仓库内还有大量 `_ = something.Update()` 式的忽略写（见第 6 节建议清单），本轮只覆盖 P0-6 列出的 6 处。
+**残余（本轮未修）.** ① `tryRealtimeFetch` 的调用点本身只有间接覆盖：驱动它需要 Gemini/Vertex 的 task plugin 与假上游，因此判定逻辑放在 model 包内直接测试，中继侧只保留"失败即放弃刷新"的薄分支。② `quota_data` 刷写失败的条目**仍随缓存一起丢弃**（保留下来会在数据库故障期间无界占用内存），本轮把它从"静默丢失"改为"显式上报 + 计数"，真正的重试/落盘缓冲是后续项。③ 仓库内还有大量 `_ = something.Update()` 式的忽略写（见第 6 节建议清单），本轮只覆盖 P0-6 列出的 6 处。④ **三库验证缺口**：本节改动落在 GORM 写入与 `RecordExist` 的判断上，AGENTS.md 要求数据库行为变更在 SQLite/MySQL/PostgreSQL 上都验证过，但本机只配置了 SQLite（MySQL/PostgreSQL 未安装、无连接串），因此上述 5 条用例只在 SQLite 上跑过；请在 CI 的三库矩阵上补跑（P2-5）。
 
 ### P0-7 计费取值在两条路径上不一致 ✅
 
