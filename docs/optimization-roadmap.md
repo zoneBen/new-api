@@ -114,6 +114,7 @@
 | P0-3 验证码与登录缺乏账户级限制 | 🚧 部分修复 | `927ab209e` 验证码<br>`6ec801848` 登录计时<br>`d3c953c7a` 代理告警<br>`826ee1357` 账户锁定 | `go build ./...`、`go vet ./...`、`go test ./controller/ ./service/ ./common/` 通过；`go test -race` 覆盖新增用例。剩余：`TRUSTED_PROXIES` 失败关闭（默认值未改，代价已写入告警与 `.env.example`）、验证码发送侧按邮箱限额、重置密码回显（需前后端联动） |
 | P0-4 明文 API Key 可凭会话直接读取 | 🛠️ 已修复 | `c62f10985` 后端<br>`5447458ce` 前端 | `go test ./controller/ -count=1` 通过（243s）、`npx vitest run` 165 文件 / 2094 用例通过。两个接口均接入 `token.key.read` step-up，证明绑定 id 集合（排序去重、上限 100），限流改按用户。行为变更：**PAT 读 key 变 403**、聊天页与仪表盘新增验证弹窗 |
 | P0-5 上游请求丢失客户端 context | 🛠️ 已修复 | `426a65d0a` | `go build ./...`、`go vet ./relay/...`、`go test ./relay/... -count=1`（18 包 ok）、`go test ./service/ -count=1` 通过；新用例 `-race` 通过且已验证"未绑定即失败"。两个入口 + 5 个自建请求的渠道站点 + MJ 提交改为绑定客户端 context；残余：ollama/baidu/jsplugin helper 与部分非中继调用方（见该节） |
+| P0-6 `recover` 吞 panic + 计费/状态写入被忽略 | 🛠️ 已修复 | `a8c7c16a6` panic<br>`a789d5f8b` 写入 | `go build ./...`、`go vet ./model/ ./relay/ ./service/`、`go test ./... -count=1` 全绿；5 个新回归用例逐个做过红/绿验证（去掉修复即失败）。10 处裸 `recover` 改为回滚 + 上报；6 处忽略的计费/状态写改为检查并上报 |
 
 ---
 
@@ -266,6 +267,23 @@ panic 后函数返回零值 `nil`，调用方认为路由能力表已重建。�
 **问题 B：计费/额度写入未检查错误.** `model/usedata.go:120` 的 `quota_data` 插入未检查错误，紧接 `:123` 仍打印"保存数据看板数据成功"（同文件 `increaseQuotaData` `:128-140` 却检查了）。`model/user.go:732,789`、`model/checkin.go:118` 中 `_ = IncreaseUserQuota(...)` 后直接写成功日志。`relay/relay_task.go:580` 的 `_, _ = task.UpdateWithStatus(...)` 之后用内存对象构造响应（`:583-599`），客户端看到的状态可能从未落库。
 
 **建议.** 具名返回值 + 记录 panic 并返回错误；计费与状态写入必须检查错误，失败时不得记录/返回成功。
+
+**🛠️ 已修复（问题 A：`a8c7c16a6`；问题 B：`a789d5f8b`）.**
+
+**问题 A（panic 被吞成成功）.** 新增 `model/tx_recover.go` 的 `recoverTxPanic(tx, operation, err *error)`：先回滚，再把 panic 转成 error 交给**具名返回值**并 `SysError` 记录；当 `err` 目标为 nil（无处可报）时**重新抛出**而不是吞掉——这一条是本轮最关键的行为约定，也是唯一"无法上报就别假装成功"的出口。10 处自建事务的裸 `defer func(){ if r := recover(); r != nil { tx.Rollback() } }()` 全部替换为 `defer recoverTxPanic(tx, "<操作名>", &err)`：`model/ability.go`（`UpdateAbilities`）、`model/channel.go` ×1、`model/user.go` ×2、`model/topup.go` ×3、`model/redemption.go` ×2 等。其中 `UpdateAbilities` 还需明确：**调用方自带 tx 时只能回滚/上报自己开启的那个**，否则会替调用方管理它的事务（该约束写进函数 doc 注释）。
+- **测试（`model/tx_recover_test.go`）.** `UpdateAbilities` 用例通过 GORM 回调在事务内注入 panic，断言既返回错误**又**回滚了 panic 前已执行的删除（旧行仍在）；读取路径 `GetAllUsers` 用例断言 panic 不再表现为"空页 + total=0"；另有"无错误目标则重新抛出"与"正常返回不覆盖已设置的错误"两条边界。回调注册在共享 `DB` 上并 `t.Cleanup` 移除，依赖 model 包测试不使用 `t.Parallel()`。
+
+**问题 B（计费/状态写入被忽略）.** 6 处：
+- `model/user.go`：注册/邀请赠送两段**完全重复**的代码里，`_ = IncreaseUserQuota(...)` 与 `_ = inviteUser(...)` 丢弃错误，而 `RecordLog` 无条件先写"赠送"日志——**发放失败也会留下审计记录**，而日志正是用户/管理员对账时唯一的依据。现抽出单一 `grantInviteRewards(inviteeId, inviterId)`，每笔奖励**写成功后才记日志**，失败走 `SysError`。
+- `model/usedata.go`：`SaveQuotaDataCache` 既没检查 `quota_data` 插入结果也没检查查询结果，且**查询失败与"还没有这一行"无法区分**——一次失败的 SELECT 会让下一次走进插入分支，为同一维度元组插入重复行，此后每次看板查询都把这个维度统计两遍（比"少统计"更糟）。现按 `RecordExist` 区分三种结果，刷写失败按条上报并在结尾汇总，只有全成功才打印原来的成功日志。
+- `relay/relay_task.go`：`_, _ = task.UpdateWithStatus(snap.Status)` 之后**用内存 task 构造响应**，写失败或 CAS 落空时客户端拿到的是从未落库、且下一次查询会推翻的状态。为此在 `model.Task` 上补 `Snapshot` 的逆操作 `Restore`，以及 `PersistIfChanged(snap)`：无变化则不发 UPDATE（避免每次轮询都拿行锁、推高 `updated_at`），失败或 CAS 落空则**先把内存 task 回滚到快照再返回错误**，`tryRealtimeFetch` 据此放弃本次实时刷新、回退到库内状态并记 `LogWarn`。
+- `model/checkin.go`：事务提交后的缓存同步丢弃错误，改为复用现有的 `syncCreditUserQuotaCache`（其语义正是"授信提交后补缓存增量"，且会记录失败）。
+- `service/system_task.go`：进度心跳用 `_ = model.UpdateSystemTaskState(...)` 丢弃**所有**错误，而原注释只打算忽略"锁丢失"这一类。现仅对 `ErrSystemTaskLockLost` 保持静默（租约心跳会取消 handler ctx，属预期），其余失败记 `LogWarn`——否则进度条卡住与"任务很慢"无法区分。
+
+- **测试.** `model/task_persist_test.go`（写入成功 / CAS 落空 / 写失败 / 无变化不发 UPDATE 四例，后三例同时断言内存 task 已回到快照）、`model/usedata_save_test.go`（查询失败不再插入重复行）、`model/invite_rewards_test.go`（写失败时**零审计记录**，写成功后两笔奖励与两条日志都在；未确认合规条款时不发放）。**五条用例均确认过去掉修复即失败（红）**：例如去掉 `Restore` 时 `Status=SUCCESS` 残留在内存对象上、去掉查询错误检查时 `quota_data` 出现 2 行、去掉日志门控时出现 2 条虚假赠送记录。
+- **验证.** `go build ./...`、`go vet ./model/ ./relay/ ./service/`、`go test ./... -count=1` 全绿。
+
+**残余（本轮未修）.** ① `tryRealtimeFetch` 的调用点本身只有间接覆盖：驱动它需要 Gemini/Vertex 的 task plugin 与假上游，因此判定逻辑放在 model 包内直接测试，中继侧只保留"失败即放弃刷新"的薄分支。② `quota_data` 刷写失败的条目**仍随缓存一起丢弃**（保留下来会在数据库故障期间无界占用内存），本轮把它从"静默丢失"改为"显式上报 + 计数"，真正的重试/落盘缓冲是后续项。③ 仓库内还有大量 `_ = something.Update()` 式的忽略写（见第 6 节建议清单），本轮只覆盖 P0-6 列出的 6 处。
 
 ### P0-7 计费取值在两条路径上不一致 ✅
 
@@ -761,7 +779,7 @@ go test -coverpkg=.../middleware -cover -run 'TestResponsesWS|TestResponsesWebSo
 3. P0-3 ~~验证码恒定时间比较 + 失败作废 + 账户级限额~~ 🛠️ 已修复（`927ab209e`、`826ee1357`）；~~登录 miss 路径跑一次 dummy argon2id~~ 🛠️ 已修复（`6ec801848`）；~~`TrustedProxies` 默认置空~~ 🚧 部分修复（`d3c953c7a`，**未改默认值**，改为把代价写进告警；残留见该节）；~~重置密码不回显~~ ❌ 未修复（需前后端联动，见该节 ④）
 4. ~~P0-4 两个 token key 接口接入 step-up 验证~~ 🛠️ 已修复（`c62f10985`、`5447458ce`；按"两个接口都加"执行，证明绑定 id 集合、限流改按用户；**PAT 读 key 变为 403**、聊天页与仪表盘新增验证弹窗，见该节）
 5. ~~P0-5 补齐 `c.Request.Context()`（含各渠道站点）~~ 🛠️ 已修复（`426a65d0a`；在构造点绑定而非改写 `doRequest`，额外发现并修复 MJ 提交的 `context.Background()` 超时；ollama/baidu/jsplugin helper 与部分非中继调用方见该节残余）
-6. P0-6 修正 `recover` 返回值与计费写入错误检查
+6. ~~P0-6 修正 `recover` 返回值与计费写入错误检查~~ 🛠️ 已修复（`a8c7c16a6` panic 上报与回滚；`a789d5f8b` 6 处计费/状态写入；`tryRealtimeFetch` 的调用点覆盖与 `quota_data` 失败重试见该节残余）
 7. P0-7 与维护者确认任务分组倍率参数；统一 `gpt-image-1` 默认质量
 8. P0-8 移除 zhipu 密钥明文日志；日志脱敏改为按参数名白名单（`key`/`api_key`/`token`/`secret`）
 9. 顺手：挂载或删除上传/下载限流；Redis 预扣脚本加 deadline；CORS 与安全响应头；关闭时刷新批更新缓冲区
