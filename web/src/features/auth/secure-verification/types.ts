@@ -26,6 +26,7 @@ export type VerificationMethod =
   | 'session'
 export type SecurityProofScope =
   | 'channel.key.read'
+  | 'token.key.read'
   | 'passkey.register'
   | 'passkey.delete'
   | '2fa.setup'
@@ -41,6 +42,7 @@ export type SecurityProofScope =
 
 export type VerificationOperation =
   | { scope: 'channel.key.read'; context: { channel_id: number } }
+  | { scope: 'token.key.read'; context: { token_ids: number[] } }
   | {
       scope: 'account.binding.bind'
       context: { provider: string; email?: string; code?: string }
@@ -49,7 +51,10 @@ export type VerificationOperation =
   | {
       scope: Exclude<
         SecurityProofScope,
-        'channel.key.read' | 'account.binding.bind' | 'account.binding.unbind'
+        | 'channel.key.read'
+        | 'token.key.read'
+        | 'account.binding.bind'
+        | 'account.binding.unbind'
       >
       context?: Record<string, never>
     }

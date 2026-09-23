@@ -19,6 +19,10 @@ For commercial licensing, please contact support@quantumnous.com
 import React, { useState, useCallback, useRef, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
 
+import {
+  SecureVerificationDialog,
+  useSecureVerification,
+} from '@/features/auth/secure-verification'
 import useDialogState from '@/hooks/use-dialog'
 import { handleServerError } from '@/lib/handle-server-error'
 
@@ -47,6 +51,7 @@ const ApiKeysContext = React.createContext<ApiKeysContextType | null>(null)
 
 export function ApiKeysProvider({ children }: { children: React.ReactNode }) {
   const { t } = useTranslation()
+  const { requestVerification, dialogProps } = useSecureVerification()
   const [open, setOpen] = useDialogState<ApiKeysDialogType>(null)
   const [currentRow, setCurrentRow] = useState<ApiKey | null>(null)
   const [refreshTrigger, setRefreshTrigger] = useState(0)
@@ -73,6 +78,19 @@ export function ApiKeysProvider({ children }: { children: React.ReactNode }) {
     setRefreshTrigger((prev) => prev + 1)
   }, [])
 
+  // A key is only disclosed against a one-use proof bound to the exact ids being
+  // revealed, so the verification has to name them before the request goes out.
+  const requestKeyProof = useCallback(
+    (tokenIds: number[]) =>
+      requestVerification({
+        scope: 'token.key.read',
+        context: { token_ids: tokenIds },
+        title: t('Verify to view API key'),
+        description: t('Confirm your identity before revealing this API key.'),
+      }),
+    [requestVerification, t]
+  )
+
   const resolveRealKey = useCallback(
     async (id: number): Promise<string | null> => {
       if (resolvedKeys[id]) return resolvedKeys[id]
@@ -81,7 +99,9 @@ export function ApiKeysProvider({ children }: { children: React.ReactNode }) {
       const request = (async () => {
         setLoadingKeys((prev) => ({ ...prev, [id]: true }))
         try {
-          const res = await fetchTokenKey(id)
+          const proof = await requestKeyProof([id])
+          if (!proof) return null
+          const res = await fetchTokenKey(id, proof.proof_token)
           if (res.success && res.data?.key) {
             const fullKey = `sk-${res.data.key}`
             setResolvedKeys((prev) => ({ ...prev, [id]: fullKey }))
@@ -105,7 +125,7 @@ export function ApiKeysProvider({ children }: { children: React.ReactNode }) {
       pendingRequests.current[id] = request
       return request
     },
-    [resolvedKeys, t]
+    [requestKeyProof, resolvedKeys, t]
   )
 
   const resolveRealKeysBatch = useCallback(
@@ -122,7 +142,9 @@ export function ApiKeysProvider({ children }: { children: React.ReactNode }) {
       }
 
       try {
-        const res = await fetchTokenKeysBatch(uncachedIds)
+        const proof = await requestKeyProof(uncachedIds)
+        if (!proof) return {}
+        const res = await fetchTokenKeysBatch(uncachedIds, proof.proof_token)
         if (res.success && res.data?.keys) {
           const newKeys: Record<number, string> = {}
           for (const [idStr, key] of Object.entries(res.data.keys)) {
@@ -151,7 +173,7 @@ export function ApiKeysProvider({ children }: { children: React.ReactNode }) {
         }
       }
     },
-    [resolvedKeys, t]
+    [requestKeyProof, resolvedKeys, t]
   )
 
   return (
@@ -174,6 +196,7 @@ export function ApiKeysProvider({ children }: { children: React.ReactNode }) {
       }}
     >
       {children}
+      <SecureVerificationDialog {...dialogProps} />
     </ApiKeysContext>
   )
 }

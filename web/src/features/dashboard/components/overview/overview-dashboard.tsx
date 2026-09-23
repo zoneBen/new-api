@@ -48,6 +48,10 @@ import {
 } from '@/components/page-transition'
 import { Button } from '@/components/ui/button'
 import { IconBadge, type IconBadgeTone } from '@/components/ui/icon-badge'
+import {
+  SecureVerificationDialog,
+  useSecureVerification,
+} from '@/features/auth/secure-verification'
 import { fetchTokenKey, getApiKeys } from '@/features/keys/api'
 import type { ApiKey } from '@/features/keys/types'
 import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard'
@@ -286,6 +290,7 @@ function RequestPreview(props: {
   const shouldReduceMotion = useReducedMotion()
   const [isCopying, setIsCopying] = useState(false)
   const { copyToClipboard } = useCopyToClipboard({ notify: false })
+  const { requestVerification, dialogProps } = useSecureVerification()
   const previewCurl = buildCurlCommand({
     endpoint: props.example.endpoint,
     apiKey: props.example.displayKey,
@@ -297,7 +302,19 @@ function RequestPreview(props: {
 
     setIsCopying(true)
     try {
-      const result = await fetchTokenKey(props.example.keyId)
+      // The real key is only released for a one-use proof bound to this key id.
+      const proof = await requestVerification({
+        scope: 'token.key.read',
+        context: { token_ids: [props.example.keyId] },
+        title: t('Verify to view API key'),
+        description: t('Confirm your identity before revealing this API key.'),
+      })
+      if (!proof) return
+
+      const result = await fetchTokenKey(
+        props.example.keyId,
+        proof.proof_token
+      )
       const key = result.success && result.data?.key ? result.data.key : ''
       if (!key) {
         handleServerError(result, t('Failed to copy to clipboard'))
@@ -416,6 +433,8 @@ function RequestPreview(props: {
           )
         })}
       </div>
+
+      <SecureVerificationDialog {...dialogProps} />
     </motion.div>
   )
 }

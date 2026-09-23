@@ -23,6 +23,7 @@ import { useTranslation } from 'react-i18next'
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
+import { SecureVerificationDialog } from '@/features/auth/secure-verification'
 import { useActiveChatKey } from '@/features/chat/hooks/use-active-chat-key'
 import { useChatPresets } from '@/features/chat/hooks/use-chat-presets'
 import {
@@ -61,6 +62,7 @@ function ChatRouteComponent() {
     isPending,
     isError,
     error,
+    dialogProps,
   } = useActiveChatKey(Boolean(preset && requiresActiveKey))
 
   const iframeSrc = useMemo(() => {
@@ -112,14 +114,19 @@ function ChatRouteComponent() {
     )
   }
 
+  // Disclosing the key needs a step-up proof, so the dialog has to stay mounted
+  // while the request is pending or refused.
   if (requiresActiveKey && isPending) {
     return (
-      <div className='flex h-full flex-col items-center justify-center gap-4'>
-        <Loader2 className='text-muted-foreground h-8 w-8 animate-spin' />
-        <p className='text-muted-foreground text-sm'>
-          {t('Preparing your chat link…')}
-        </p>
-      </div>
+      <>
+        <div className='flex h-full flex-col items-center justify-center gap-4'>
+          <Loader2 className='text-muted-foreground h-8 w-8 animate-spin' />
+          <p className='text-muted-foreground text-sm'>
+            {t('Preparing your chat link…')}
+          </p>
+        </div>
+        <SecureVerificationDialog {...dialogProps} />
+      </>
     )
   }
 
@@ -129,12 +136,15 @@ function ChatRouteComponent() {
         ? error.message
         : 'Unable to generate chat link. Please check your API keys.'
     return (
-      <div className='flex h-full flex-col items-center justify-center p-6'>
-        <Alert variant='destructive' className='max-w-xl'>
-          <AlertTitle>{t('Unable to open chat')}</AlertTitle>
-          <AlertDescription>{message}</AlertDescription>
-        </Alert>
-      </div>
+      <>
+        <div className='flex h-full flex-col items-center justify-center p-6'>
+          <Alert variant='destructive' className='max-w-xl'>
+            <AlertTitle>{t('Unable to open chat')}</AlertTitle>
+            <AlertDescription>{message}</AlertDescription>
+          </Alert>
+        </div>
+        <SecureVerificationDialog {...dialogProps} />
+      </>
     )
   }
 

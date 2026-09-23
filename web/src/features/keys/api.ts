@@ -108,20 +108,32 @@ export async function updateApiKeyStatus(
   return res.data
 }
 
-// Fetch the real (unmasked) key for a token by ID
+// Fetch the real (unmasked) key for a token by ID. The server only discloses a key
+// to a one-use step-up proof bound to this exact token id.
 export async function fetchTokenKey(
-  id: number
+  id: number,
+  proofToken: string
 ): Promise<{ success: boolean; message?: string; data?: { key: string } }> {
-  const res = await api.post(`/api/token/${id}/key`)
+  const res = await api.post(`/api/token/${id}/key`, undefined, {
+    headers: { 'X-Security-Proof': proofToken },
+  })
   return res.data
 }
 
-// Batch fetch real (unmasked) keys for multiple tokens
-export async function fetchTokenKeysBatch(ids: number[]): Promise<{
+// Batch fetch real (unmasked) keys for multiple tokens. The proof has to cover the
+// whole requested id set, so it cannot be widened from a single-key disclosure.
+export async function fetchTokenKeysBatch(
+  ids: number[],
+  proofToken: string
+): Promise<{
   success: boolean
   message?: string
   data?: { keys: Record<number, string> }
 }> {
-  const res = await api.post('/api/token/batch/keys', { ids })
+  const res = await api.post(
+    '/api/token/batch/keys',
+    { ids },
+    { headers: { 'X-Security-Proof': proofToken } }
+  )
   return res.data
 }
