@@ -1801,3 +1801,84 @@ func TestSettle_TokenRecalcFallsBackToCompletionTokens(t *testing.T) {
 		})
 	}
 }
+
+func setTaskGroupRatios(t *testing.T, groupRatios string, groupGroupRatios string) {
+	t.Helper()
+	savedGroupRatios := ratio_setting.GroupRatio2JSONString()
+	savedGroupGroupRatios := ratio_setting.GroupGroupRatio2JSONString()
+	t.Cleanup(func() {
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(savedGroupRatios))
+		require.NoError(t, ratio_setting.UpdateGroupGroupRatioByJSONString(savedGroupGroupRatios))
+	})
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(groupRatios))
+	require.NoError(t, ratio_setting.UpdateGroupGroupRatioByJSONString(groupGroupRatios))
+}
+
+func seedRatioUser(t *testing.T, username string, group string) *model.User {
+	t.Helper()
+	user := &model.User{Username: username, AffCode: "aff-" + username, Group: group}
+	require.NoError(t, model.DB.Create(user).Error)
+	t.Cleanup(func() { model.DB.Delete(&model.User{}, user.Id) })
+	return user
+}
+
+// TestResolveTaskGroupRatioUsesTheUserGroupForCrossGroupSpecial covers P0-7A: the
+// token-based settlement used to pass the same group twice, so the cross-group
+// special ratio ("a user in group X using group Y") never applied and settlement
+// recomputed at a different rate than the pre-charge had used. The task row only
+// stores the using group, so the user's own group has to be looked up.
+func TestResolveTaskGroupRatioUsesTheUserGroupForCrossGroupSpecial(t *testing.T) {
+	setTaskGroupRatios(t, `{"default":1,"vip":1}`, `{"vip":{"default":0.5}}`)
+	user := seedRatioUser(t, "ratio-vip", "vip")
+
+	ratio, ok := resolveTaskGroupRatio(&model.Task{UserId: user.Id, Group: "default"})
+
+	require.True(t, ok)
+	assert.Equal(t, 0.5, ratio)
+}
+
+// TestResolveTaskGroupRatioFallsBackToTheUsingGroup keeps the plain case intact:
+// with no cross-group entry for that pair, the using group's own ratio is used.
+func TestResolveTaskGroupRatioFallsBackToTheUsingGroup(t *testing.T) {
+	setTaskGroupRatios(t, `{"default":1,"vip":1,"svip":2}`, `{"vip":{"default":0.5}}`)
+	user := seedRatioUser(t, "ratio-plain", "vip")
+
+	// The user is in vip but the task used svip, and no vip→svip entry exists.
+	ratio, ok := resolveTaskGroupRatio(&model.Task{UserId: user.Id, Group: "svip"})
+
+	require.True(t, ok)
+	assert.Equal(t, 2.0, ratio)
+}
+
+// TestResolveTaskGroupRatioUsesTheUserGroupWhenTheTaskHasNone covers rows written
+// before the task stored a group: the user's own group is the only source.
+func TestResolveTaskGroupRatioUsesTheUserGroupWhenTheTaskHasNone(t *testing.T) {
+	setTaskGroupRatios(t, `{"default":1,"vip":3}`, `{}`)
+	user := seedRatioUser(t, "ratio-legacy", "vip")
+
+	ratio, ok := resolveTaskGroupRatio(&model.Task{UserId: user.Id})
+
+	require.True(t, ok)
+	assert.Equal(t, 3.0, ratio)
+}
+
+// TestResolveTaskGroupRatioWithoutAUserOrAGroup reports the one case that cannot
+// be settled: no group on the task and no user row to fall back to.
+func TestResolveTaskGroupRatioWithoutAUserOrAGroup(t *testing.T) {
+	setTaskGroupRatios(t, `{"default":1,"vip":1}`, `{}`)
+
+	_, ok := resolveTaskGroupRatio(&model.Task{UserId: 987654})
+
+	assert.False(t, ok)
+}
+
+// TestResolveTaskGroupRatioIgnoresADeletedUser keeps settlement working when the
+// account is gone: the using group's ratio still applies.
+func TestResolveTaskGroupRatioIgnoresADeletedUser(t *testing.T) {
+	setTaskGroupRatios(t, `{"default":1,"vip":4}`, `{}`)
+
+	ratio, ok := resolveTaskGroupRatio(&model.Task{UserId: 987654, Group: "vip"})
+
+	require.True(t, ok)
+	assert.Equal(t, 4.0, ratio)
+}

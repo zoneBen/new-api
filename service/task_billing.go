@@ -392,26 +392,14 @@ func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTo
 		return false
 	}
 
-	// 获取用户和组的倍率信息
-	group := task.Group
-	if group == "" {
-		user, err := model.GetUserById(task.UserId, false)
-		if err == nil {
-			group = user.Group
-		}
-	}
-	if group == "" {
+	// 获取用户和组的倍率信息。
+	// task.Group 存的是本次请求实际使用的组（using group，写入见 relay/relay_task.go），
+	// 而跨组特价倍率的第一维是**用户自己所在的组**：预扣时用的就是
+	// GetGroupGroupRatio(UserGroup, UsingGroup)。若把同一个值当成用户组，
+	// 等于只查"同组"条目，跨组特价在差额结算时失效，结算与预扣便用了不同倍率。
+	finalGroupRatio, ok := resolveTaskGroupRatio(task)
+	if !ok {
 		return false
-	}
-
-	groupRatio := ratio_setting.GetGroupRatio(group)
-	userGroupRatio, hasUserGroupRatio := ratio_setting.GetGroupGroupRatio(group, group)
-
-	var finalGroupRatio float64
-	if hasUserGroupRatio {
-		finalGroupRatio = userGroupRatio
-	} else {
-		finalGroupRatio = groupRatio
 	}
 
 	// 计算 OtherRatios 乘积（视频折扣、时长等）
@@ -426,6 +414,33 @@ func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTo
 	reason := fmt.Sprintf("token重算：tokens=%d, modelRatio=%.2f, groupRatio=%.2f, otherMultiplier=%.4f", totalTokens, modelRatio, finalGroupRatio, otherMultiplier)
 	RecalculateTaskQuota(ctx, task, actualQuota, reason, clamp)
 	return true
+}
+
+// resolveTaskGroupRatio 返回任务差额结算应使用的分组倍率，ok=false 表示无法确定分组。
+//
+// using group 取任务记录里的 task.Group（提交时写入的是实际使用的组）；user group 取
+// 用户当前的组，因为跨组特价倍率的第一维是用户组：预扣走的是
+// GetGroupGroupRatio(UserGroup, UsingGroup)（relay/helper/price.go HandleGroupRatio），
+// 结算必须用同一对参数，否则特价只在预扣时生效、差额结算又按原价重算。
+func resolveTaskGroupRatio(task *model.Task) (float64, bool) {
+	usingGroup := task.Group
+	userGroup := ""
+	if user, err := model.GetUserById(task.UserId, false); err == nil {
+		userGroup = user.Group
+		if usingGroup == "" {
+			// 老任务可能没有 group，退回用户所在的组
+			usingGroup = user.Group
+		}
+	}
+	if usingGroup == "" {
+		return 0, false
+	}
+	// 查不到用户组（用户已删除或查询失败）时 userGroup 为空，GetGroupGroupRatio
+	// 返回 false，落到使用组自身的倍率——与修复前对非空 task.Group 的行为一致。
+	if userGroupRatio, ok := ratio_setting.GetGroupGroupRatio(userGroup, usingGroup); ok {
+		return userGroupRatio, true
+	}
+	return ratio_setting.GetGroupRatio(usingGroup), true
 }
 
 // EvaluateTaskCompletionUsage evaluates actual facts against the frozen task
