@@ -112,6 +112,7 @@
 | P0-1 `/api/setup` 未授权创建 root | 🛠️ 已修复 | `91f20bae3` | `go build ./...`、`go vet`、`go test ./middleware/ ./common/ ./router/` 通过；17 个子用例覆盖令牌/回环/内网/公网/伪造 `X-Forwarded-For`/反向代理 |
 | P0-2 MJ 图片代理越权读取 | 🛠️ 已修复 | `38ddfde30` | `go build ./...`、`go vet`、`go test ./relay/ ./service/ ./controller/` 通过；路由级用例覆盖无签名/篡改/他人任务签名被拒且不触达上游，正确签名返回 200 + `image/png` |
 | P0-3 验证码与登录缺乏账户级限制 | 🚧 部分修复 | `927ab209e` 验证码<br>`6ec801848` 登录计时<br>`d3c953c7a` 代理告警<br>`826ee1357` 账户锁定 | `go build ./...`、`go vet ./...`、`go test ./controller/ ./service/ ./common/` 通过；`go test -race` 覆盖新增用例。剩余：`TRUSTED_PROXIES` 失败关闭（默认值未改，代价已写入告警与 `.env.example`）、验证码发送侧按邮箱限额、重置密码回显（需前后端联动） |
+| P0-4 明文 API Key 可凭会话直接读取 | 🛠️ 已修复 | `c62f10985` 后端<br>`5447458ce` 前端 | `go test ./controller/ -count=1` 通过（243s）、`npx vitest run` 165 文件 / 2094 用例通过。两个接口均接入 `token.key.read` step-up，证明绑定 id 集合（排序去重、上限 100），限流改按用户。行为变更：**PAT 读 key 变 403**、聊天页与仪表盘新增验证弹窗 |
 
 ---
 
@@ -208,6 +209,18 @@ Gin 的 `Use` 只作用于其后注册的路由，因此 `/mj/image/:id` 与 `/:
 **影响.** 任何被盗会话（或泄露的 PAT——`UserAuth` 接受 PAT）都能一次性导出账户下全部中继密钥，且密钥不随密码修改而轮换，等于持久化的额度盗用。
 
 **建议.** 两个路由接入 `RequireSecurityProof` / `SecureVerificationRequired`；限流改为按用户维度，而非按可伪造的 IP。
+
+**🛠️ 已修复（`c62f10985` 后端、`5447458ce` 前端）.** 两个接口都接入了 step-up，按"两个接口都加"的选择执行：
+- **作用域与绑定.** 新增 `VerificationScopeTokenKeyRead`（`token.key.read`），上下文为 `token_ids`。`normalizeTokenKeyReadIDs` 先排序去重，因此 `[A,B]` 与 `[B,A]` 等价、一份证明只覆盖它被签发的那个 id 集合；拒绝空集与非正数；上限 100，与批接口自身的 `MsgBatchTooMany` 对齐。
+- **控制器.** `GetTokenKey` / `GetTokenKeysBatch` 在**参数校验之后**调用 `requireTokenKeyReadProof`，参数非法仍报 `MsgInvalidParams` 而不是"缺少证明"，避免把参数错误伪装成安全错误。
+- **限流.** 两条路由由全局 `CriticalRateLimit` 改为 `UserCriticalRateLimit("token-key-read")`，不再与全站共享桶、也不再受可伪造 IP 影响。
+- **前端.** 四处读取点都先弹二次验证再把证明放进 `X-Security-Proof`：`api-keys-provider` 的单条与批量、dashboard `RequestPreview` 的复制、聊天链接（`chat/$chatId`、`chat2link`、侧边栏外部客户端入口）。聊天链接的查询设 `retry: false`——一次弹窗是一个用户决定，不是重试循环；取消即中止且不会在用户背后重开弹窗，`isPending`/错误分支保持弹窗挂载。
+- **测试.** 后端 `TestSecurityEnrollmentTokenKeyReadRequiresBoundProof`：该作用域只提供 password 方式、缺证明 403、授权读取、重放 `SECURITY_PROOF_CONSUMED`、用 A 的证明读 B 得 `SECURITY_PROOF_CONTEXT_MISMATCH`、单 id 证明打批接口被拒、`[A,B]` 与 `[B,A]` 等价、他人 token 可见但不返回 key；审计矩阵每个用例各签一份证明，保留原有的审计事件与"不泄露"断言。前端 `api-key-listing.test.tsx` 驱动弹窗并断言"验证前不发出任何 key 请求""取消后不发任何请求、不写剪贴板"。
+- **验证.** `go test ./controller/ -count=1` 通过（243.162s）；`npx vitest run` 165 文件 / 2094 用例全部通过。**仅本地 SQLite 验证，未跑 MySQL/PostgreSQL**（本机无 DSN）；改动不含新查询形态，与方言无关。
+
+**行为变更（需知晓）.** ① **PAT 不能再读 key.** step-up 证明是会话级的（`GetSessionAuthIdentity` 拒绝 PAT 认证），因此"用 PAT 读 key"从 `200` 变为 `403 SECURITY_PROOF_INVALID`。这是有意的，与 `channel.key.read` 的既有行为一致，但会打断用 PAT 导出密钥的脚本，这类自动化需改为会话登录。② **聊天页与仪表盘现在会弹二次验证**：进入 `/chat/$chatId`、`chat2link`、侧边栏外部客户端入口、dashboard 请求示例的复制按钮都会先要求验证；取消则不再生成链接、不写剪贴板。
+
+**残余.** 未引入"同作用域短期免验证窗口"，因此同一会话连续查看多个 key 会多次弹窗（安全优先；若体验不可接受，可后续为同作用域加 N 分钟内的复用）。证明按 id 集合绑定，若将来新增批量导出类接口，需各自申请对应 id 集合的证明，不能复用单条读取的证明。
 
 ### P0-5 上游请求丢失客户端 context ✅
 
@@ -736,7 +749,7 @@ go test -coverpkg=.../middleware -cover -run 'TestResponsesWS|TestResponsesWebSo
 1. ~~P0-1 `/api/setup` 加一次性 setup token 或限制回环；顺带限制 `GET /api/setup`~~ 🛠️ 已修复（`91f20bae3`；`GET /api/setup` 有意保留开放，见该节残余风险）
 2. ~~P0-2 修正 MJ 路由中间件顺序 + 补归属校验~~ 🛠️ 已修复（`38ddfde30`；改为签名能力 URL，**不是**移动中间件顺序，原因见该节建议 1）
 3. P0-3 ~~验证码恒定时间比较 + 失败作废 + 账户级限额~~ 🛠️ 已修复（`927ab209e`、`826ee1357`）；~~登录 miss 路径跑一次 dummy argon2id~~ 🛠️ 已修复（`6ec801848`）；~~`TrustedProxies` 默认置空~~ 🚧 部分修复（`d3c953c7a`，**未改默认值**，改为把代价写进告警；残留见该节）；~~重置密码不回显~~ ❌ 未修复（需前后端联动，见该节 ④）
-4. P0-4 两个 token key 接口接入 step-up 验证
+4. ~~P0-4 两个 token key 接口接入 step-up 验证~~ 🛠️ 已修复（`c62f10985`、`5447458ce`；按"两个接口都加"执行，证明绑定 id 集合、限流改按用户；**PAT 读 key 变为 403**、聊天页与仪表盘新增验证弹窗，见该节）
 5. P0-5 补齐 `c.Request.Context()`（含各渠道站点）
 6. P0-6 修正 `recover` 返回值与计费写入错误检查
 7. P0-7 与维护者确认任务分组倍率参数；统一 `gpt-image-1` 默认质量
