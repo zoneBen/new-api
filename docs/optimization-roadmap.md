@@ -115,6 +115,7 @@
 | P0-4 明文 API Key 可凭会话直接读取 | 🛠️ 已修复 | `c62f10985` 后端<br>`5447458ce` 前端 | `go test ./controller/ -count=1` 通过（243s）、`npx vitest run` 165 文件 / 2094 用例通过。两个接口均接入 `token.key.read` step-up，证明绑定 id 集合（排序去重、上限 100），限流改按用户。行为变更：**PAT 读 key 变 403**、聊天页与仪表盘新增验证弹窗 |
 | P0-5 上游请求丢失客户端 context | 🛠️ 已修复 | `426a65d0a` | `go build ./...`、`go vet ./relay/...`、`go test ./relay/... -count=1`（18 包 ok）、`go test ./service/ -count=1` 通过；新用例 `-race` 通过且已验证"未绑定即失败"。两个入口 + 5 个自建请求的渠道站点 + MJ 提交改为绑定客户端 context；残余：ollama/baidu/jsplugin helper 与部分非中继调用方（见该节） |
 | P0-6 `recover` 吞 panic + 计费/状态写入被忽略 | 🛠️ 已修复 | `a8c7c16a6` panic<br>`a789d5f8b` 写入 | `go build ./...`、`go vet ./model/ ./relay/ ./service/`、`go test ./... -count=1` 全绿；5 个新回归用例逐个做过红/绿验证（去掉修复即失败）。10 处裸 `recover` 改为回滚 + 上报；6 处忽略的计费/状态写改为检查并上报 |
+| P0-7 计费取值在两条路径上不一致 | 🛠️ 已修复 | `36f1cd355` 倍率<br>`457682f72` 质量 | `go build ./...`、`go vet ./relay/ ./relay/helper/`、`go test ./relay/ ./relay/helper/ ./service/ -count=1` 全绿；新用例逐个做过红/绿验证（7A：5 例；7B：2 例，其中一例钉住"默认值不得外溢到 dall-e"）。语义按维护者选定方案 A（补真实用户组）。**MySQL/PostgreSQL 本机未配置，仅在 SQLite 上验证（见该节残余）** |
 
 ---
 
@@ -299,6 +300,46 @@ userGroupRatio, hasUserGroupRatio := ratio_setting.GetGroupGroupRatio(group, gro
 **问题 B：同一图片模型在两种传输路径下默认质量不同.** `relay/helper/valid_request.go:223-226`（multipart/form 路径）把 `gpt-image-1` 的空 `quality` 设为 `"standard"`；`:261-264`（JSON 路径）设为 `"auto"`。质量是计费乘数（AGENTS.md 明确列出），同一逻辑请求会因传输方式被不同计价。
 
 **建议.** 由维护者确认 P0-7A 的正确第二参数后修正并补回归用例；P0-7B 抽取统一的 `gpt-image-1` 默认值（与 `dto.MaxImageN` 校验、`top_p` 夹取一样集中到一处）。
+
+**🛠️ 已修复（问题 A：`36f1cd355`；问题 B：`457682f72`）.**
+
+**问题 A（跨组特价只在预扣生效，差额结算按原价重算）.** 维护者选定方案 A —— 补**真实用户组**：`RecalculateTaskQuotaByTokens` 里的 `(group, group)` 改为调用新抽出的 `resolveTaskGroupRatio(task)`：
+
+```go
+func resolveTaskGroupRatio(task *model.Task) (float64, bool) {
+	usingGroup := task.Group
+	userGroup := ""
+	if user, err := model.GetUserById(task.UserId, false); err == nil {
+		userGroup = user.Group
+		if usingGroup == "" {           // 老任务可能没有 group
+			usingGroup = user.Group
+		}
+	}
+	if usingGroup == "" {
+		return 0, false
+	}
+	if userGroupRatio, ok := ratio_setting.GetGroupGroupRatio(userGroup, usingGroup); ok {
+		return userGroupRatio, true
+	}
+	return ratio_setting.GetGroupRatio(usingGroup), true
+}
+```
+
+- **两个维度的来源**：using group 取 `task.Group`（提交时写入的是 `relayInfo.UsingGroup`，见 `model/task.go:273`）；user group 取 `GetUserById(task.UserId).Group`——任务行**不存**用户组，只能回查。这正是要补的那一维。
+- **为什么必须补**：`groupGroupRatioMap` 的键是**用户组→使用组**，默认值只有一个条目 `{"vip":{"edit_this":0.9}}`。传两个相同参数等于只查"同组"条目，跨组特价几乎永远命中不了；而预扣走的是 `relay/helper/price.go:57` 的 `(UserGroup, UsingGroup)`。两者不一致的后果是**差额结算把已经打过的折扣又扣回去**（预扣按特价、结算按原价），且只在"用户组 ≠ 使用组且有特价条目"时出现——正好是最难被发现的组合。
+- **不猜倍率**：`task.Group` 为空且用户查不到（已删除或查询失败）时返回 `ok=false`，`RecalculateTaskQuotaByTokens` 直接跳过差额结算，保持原预扣值；用户组查不到但 `task.Group` 非空时，`GetGroupGroupRatio("", usingGroup)` 返回 false，回落到使用组自身倍率——与修复前对非空 `task.Group` 的行为一致（不放大差异）。
+- **测试（`service/task_billing_test.go`）**：5 例，分别覆盖跨组特价命中（vip→default = 0.5，修复前得 1）、无该条目时回落使用组倍率、老任务无 `group` 时用用户组、无用户且无分组时 `ok=false`、用户已删除时仍按使用组倍率结算。**红验证**：把查表还原为 `GetGroupGroupRatio(group, group)` 后，跨组特价一例失败（期望 0.5、实得 1）。
+- **同类排查**：全仓 `GetGroupGroupRatio` 调用点共 5 处（含本次修复的 `service/task_billing.go:440`），其余 4 处（`relay/helper/price.go:57`、`controller/pricing.go:50`、`service/group.go:128`、`service/quota.go:117`）均传两个不同值，**没有**第二处同参调用。
+
+**问题 B（同一图片模型在两条传输路径下默认质量不同）.** 新增 `dto.DefaultGptImageQuality = "auto"`（`relaykit/dto/openai_image.go`，与 `MaxImageN` 同处），两条校验路径改为引用同一常量；`relay/image_handler.go:178` 的日志兜底也不再对 `gpt-image-1` 报 `standard`。
+
+- **为什么取 `auto`**：`gpt-image-1` 接受 `low/medium/high/auto`、默认 `auto`；`standard` 是 dall-e-3 的取值（仓库内已有同结论注释：`relay/channel/gemini/adaptor.go:107-123`）。multipart 路径沿用旧值不只是计费输入不同，还会把 `quality=standard` **发给上游**——该模型不接受这个取值。这次改动前我按此顺序核对了质量如何进入计费：`relay/helper/valid_request.go` → `relay/helper/billing_expr_request.go:48` 把它冻结进表达式输入 `u("quality")` → `relay/image_handler.go:178` 只用于日志文本，不影响价格。**并且**确认 `legacyDallePriceRatio()`（`relaykit/dto/legacy_dalle_image.go:38`）对非 dall-e 模型直接返回 1，因此旧默认值没有污染 dall-e 的尺寸/质量价目表，影响面就是表达式计费输入与上行参数。
+- **改动面刻意收窄**：multipart 路径对 dall-e-2/dall-e-3 仍然**不填** quality（dall-e-2 不接受该参数），dall-e-3 的 `standard` 默认仍由 `NormalizeLegacyDalleImageRequest` 负责。
+- **测试（`relay/helper/openai_image_request_test.go`）**：`TestImageRequestQualityDefaultIsSharedAcrossTransports` 用 5 例（三条默认值路径：JSON generations / JSON edits / multipart edits；另两条断言客户端显式指定的 quality 在两种传输上都被保留）断言两条路径解出**同一个**默认值，并断言该值确实进入冻结的计费请求输入；`TestMultipartQualityDefaultStaysScopedToGptImage` 钉住"默认值不得外溢到 legacy 模型"（dall-e-2/dall-e-3 的 multipart 仍为空）。
+- **红验证**：① 把 multipart 分支还原为 `"standard"` → 跨路径一例失败（期望 `auto`、实得 `standard`）；② 去掉 `Model == "gpt-image-1"` 条件、对所有模型填默认值 → 外溢一例的 dall-e-2/dall-e-3 子用例失败。
+- **验证命令**：`gofmt -l`（4 个文件均无输出）、`go build ./...`、`go vet ./relay/ ./relay/helper/`、`(cd relaykit && go vet ./dto/ && go build ./...)`、`go test ./relay/ ./relay/helper/ ./service/ -count=1` 全绿。
+
+**残余（本轮未修）.** ① **三库验证缺口**：`resolveTaskGroupRatio` 依赖 `GetUserById`，AGENTS.md 要求数据库行为变更在 SQLite/MySQL/PostgreSQL 上都验证过，但本机只配置了 SQLite（MySQL/PostgreSQL 未安装、无连接串），因此 7A 只在 SQLite 上跑过；查询本身是 GORM 单行主键查询、无方言差异，但这一点**未实测**，请在 CI 的三库矩阵上补跑（P2-5）。② 7A 只让结算与"任务当时的 using group"一致：预扣倍率来自提交时冻结的 `BillingContext.GroupRatio`，若用户在**建任务与结算之间换组**，两处仍会不同（换组对在途任务的影响是独立问题，本轮未处理）。③ 7B 的默认值只覆盖**恰好** `gpt-image-1`：`gpt-image-1-mini`/`gpt-image-1.5`/`chatgpt-image-latest` 在两条路径上都留空（彼此一致，不构成分歧），若要一并改为 `auto` 需单独评估对表达式计费的影响。④ 问题 B 的**证据基线**未复测：原审计只断言"两条路径取值不同"，本轮补上了"该值进入计费输入"这一环的代码证据，但**没有**跑一次带 `u("quality")` 分支的表达式来端到端展示两条路径实得价格不同。
 
 ### P0-8 渠道 API Key 被完整写入日志 ✅
 
@@ -780,7 +821,7 @@ go test -coverpkg=.../middleware -cover -run 'TestResponsesWS|TestResponsesWebSo
 4. ~~P0-4 两个 token key 接口接入 step-up 验证~~ 🛠️ 已修复（`c62f10985`、`5447458ce`；按"两个接口都加"执行，证明绑定 id 集合、限流改按用户；**PAT 读 key 变为 403**、聊天页与仪表盘新增验证弹窗，见该节）
 5. ~~P0-5 补齐 `c.Request.Context()`（含各渠道站点）~~ 🛠️ 已修复（`426a65d0a`；在构造点绑定而非改写 `doRequest`，额外发现并修复 MJ 提交的 `context.Background()` 超时；ollama/baidu/jsplugin helper 与部分非中继调用方见该节残余）
 6. ~~P0-6 修正 `recover` 返回值与计费写入错误检查~~ 🛠️ 已修复（`a8c7c16a6` panic 上报与回滚；`a789d5f8b` 6 处计费/状态写入；`tryRealtimeFetch` 的调用点覆盖与 `quota_data` 失败重试见该节残余）
-7. P0-7 与维护者确认任务分组倍率参数；统一 `gpt-image-1` 默认质量
+7. ~~P0-7 与维护者确认任务分组倍率参数~~ 🛠️ 已修复（`36f1cd355` 按"补真实用户组"修正差额结算倍率；`457682f72` 统一 `gpt-image-1` 默认质量为一处常量。问题 B 的端到端计价复现与三库验证缺口见该节残余）
 8. P0-8 移除 zhipu 密钥明文日志；日志脱敏改为按参数名白名单（`key`/`api_key`/`token`/`secret`）
 9. 顺手：挂载或删除上传/下载限流；Redis 预扣脚本加 deadline；CORS 与安全响应头；关闭时刷新批更新缓冲区
 
@@ -862,7 +903,7 @@ cd web && bun install --frozen-lockfile && bun run typecheck && bun run lint && 
 
 以下结论在落地前必须先复现，不要直接据以改动：
 
-1. **P0-7A 的语义**：`service/task_billing.go:408` 传两个相同参数，属笔误还是刻意？需维护者确认正确语义（对照 `relay/helper/price.go:42-69` 与 `service/quota.go:106-120` 两种写法，后者使用类型化常量 `constant.ContextKeyAutoGroup`，前者用字面量 `"auto_group"`）。
+1. ~~**P0-7A 的语义**：`service/task_billing.go:408` 传两个相同参数，属笔误还是刻意？~~ **已确认（2026-09-23，维护者选定方案 A）**：不是刻意，正确语义是"补真实用户组"，即 `GetGroupGroupRatio(UserGroup, UsingGroup)`；已实现并推送（`36f1cd355`），用例见该节 🛠️。对照项 `service/quota.go:106-120` 使用类型化常量 `constant.ContextKeyAutoGroup`、`relay/helper/price.go:42-69` 用字面量 `"auto_group"` 的**不一致**本轮未处理，仍待清理。
 2. **P1-1/P1-2/P1-3 的性能量级**：全部为静态分析结论，未经 profiler 实测。建议先在生产可观测的实例上采一次 CPU/heap profile 与 DB 查询计数，再按实际占比排序。
 3. **定价缓存的竞态**：`model/pricing.go:80,90` 在锁外读写 `pricingMap` / `lastGetPricingTime`（写方 `:97,327,429,447`）。本次 `-race` 未触发，因为现有用例未覆盖该路径；**需要专门的并发用例确认**后再修。
 4. **渠道状态就地修改的竞态**：`model/channel_cache.go:258` 在写锁内改 `channel.Status`，读者 `service/channel_select.go:296`、`relay/responses_websocket.go:537`、`relay/mjproxy_handler.go:317` 无锁读取。同样需要专门用例确认。
