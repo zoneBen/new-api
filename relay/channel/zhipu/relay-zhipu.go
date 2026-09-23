@@ -2,7 +2,10 @@ package zhipu
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -41,7 +44,15 @@ func getZhipuToken(apikey string) string {
 
 	split := strings.Split(apikey, ".")
 	if len(split) != 2 {
-		common.SysLog("invalid zhipu key: " + apikey)
+		// Never log the key itself. This branch is reached exactly when the key
+		// does not look the way the provider documents (a mistyped key, a key
+		// from another channel, a truncated paste), which is also when an
+		// operator needs to know *which* value was rejected — so record shape
+		// facts plus a short fingerprint, which correlates repeated failures of
+		// one key without the key ever reaching a log file.
+		common.SysLog(fmt.Sprintf(
+			"invalid zhipu key: expected one \"<id>.<secret>\" pair, got %d segment(s), length=%d, hasWhitespace=%t, fingerprint=%s",
+			len(split), len(apikey), strings.TrimSpace(apikey) != apikey, logSafeKeyFingerprint(apikey)))
 		return ""
 	}
 
@@ -75,6 +86,14 @@ func getZhipuToken(apikey string) string {
 	})
 
 	return tokenString
+}
+
+// logSafeKeyFingerprint derives a short, stable, non-reversible identifier for a
+// credential. It lets an operator tell repeated failures of the same key apart
+// in the log without the key itself being recoverable from the log entry.
+func logSafeKeyFingerprint(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:4])
 }
 
 func requestOpenAI2Zhipu(request dto.GeneralOpenAIRequest) *ZhipuRequest {
