@@ -5,6 +5,8 @@ import (
 	"context"
 	"database/sql/driver"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -533,6 +535,51 @@ func (t *Task) Snapshot() taskSnapshot {
 		PluginState:  t.PrivateData.PluginState,
 		PollFailures: t.PrivateData.PollFailures,
 	}
+}
+
+// Restore returns the task to a previously taken Snapshot.
+//
+// A caller that overwrote the in-memory task with fresh upstream state must be
+// able to undo that when the write did not reach the database: otherwise a
+// response built from this task describes a transition no later read confirms.
+func (t *Task) Restore(s taskSnapshot) {
+	t.Status = s.Status
+	t.Progress = s.Progress
+	t.StartTime = s.StartTime
+	t.FinishTime = s.FinishTime
+	t.FailReason = s.FailReason
+	t.PrivateData.ResultURL = s.ResultURL
+	t.Data = s.Data
+	t.PrivateData.PluginState = s.PluginState
+	t.PrivateData.PollFailures = s.PollFailures
+}
+
+// ErrTaskSnapshotNotPersisted reports that an in-memory task update never
+// reached the database: the write failed, or another writer already moved the
+// task out of the status the update was guarded by.
+var ErrTaskSnapshotNotPersisted = errors.New("task snapshot was not persisted")
+
+// PersistIfChanged writes the task back when it differs from snap.
+//
+// It returns nil only when the database is known to hold the task as it now
+// stands in memory. On error the in-memory task must not be reported as updated:
+// the write did not land and the task has already been restored to snap, so the
+// caller falls back to the stored state instead of announcing a transition that
+// no later read would confirm.
+func (t *Task) PersistIfChanged(snap taskSnapshot) error {
+	if snap.Equal(t.Snapshot()) {
+		return nil
+	}
+	updated, err := t.UpdateWithStatus(snap.Status)
+	if err != nil {
+		t.Restore(snap)
+		return fmt.Errorf("%w: %s", ErrTaskSnapshotNotPersisted, err.Error())
+	}
+	if !updated {
+		t.Restore(snap)
+		return fmt.Errorf("%w: status %s was no longer current", ErrTaskSnapshotNotPersisted, snap.Status)
+	}
+	return nil
 }
 
 func (Task *Task) Update() error {

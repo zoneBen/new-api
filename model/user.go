@@ -582,6 +582,35 @@ func inviteUser(inviterId int) error {
 	return nil
 }
 
+// grantInviteRewards hands out the invite bonuses for a freshly created user.
+// It is a no-op when the user did not come from an invite code (inviterId 0) or
+// when the payment compliance terms have not been accepted.
+//
+// Each reward is logged only once its write succeeded: the log table is the
+// audit trail users and admins read to explain their balance, so an entry that
+// claims a grant which never happened is worse than a missing entry. The
+// inviter's reward is granted by inviteUser (aff_quota/aff_history), not by a
+// quota increase, which is why only its failure needs reporting here.
+func grantInviteRewards(inviteeId int, inviterId int) {
+	if inviterId == 0 || !operation_setting.IsPaymentComplianceConfirmed() {
+		return
+	}
+	if common.QuotaForInvitee > 0 {
+		if err := IncreaseUserQuota(inviteeId, common.QuotaForInvitee, true); err != nil {
+			common.SysError(fmt.Sprintf("使用邀请码赠送额度失败: user_id=%d, error=%s", inviteeId, err.Error()))
+		} else {
+			RecordLog(inviteeId, LogTypeSystem, fmt.Sprintf("使用邀请码赠送 %s", logger.LogQuota(common.QuotaForInvitee)))
+		}
+	}
+	if common.QuotaForInviter > 0 {
+		if err := inviteUser(inviterId); err != nil {
+			common.SysError(fmt.Sprintf("邀请用户赠送额度失败: inviter_id=%d, error=%s", inviterId, err.Error()))
+		} else {
+			RecordLog(inviterId, LogTypeSystem, fmt.Sprintf("邀请用户赠送 %s", logger.LogQuota(common.QuotaForInviter)))
+		}
+	}
+}
+
 func (user *User) TransferAffQuotaToQuota(quota int) error {
 	// 检查quota是否小于最小额度
 	if float64(quota) < common.QuotaPerUnit {
@@ -715,17 +744,7 @@ func (user *User) finishInsert(inviterId int) {
 	if common.QuotaForNewUser > 0 {
 		RecordLog(user.Id, LogTypeSystem, fmt.Sprintf("新用户注册赠送 %s", logger.LogQuota(common.QuotaForNewUser)))
 	}
-	if inviterId != 0 && operation_setting.IsPaymentComplianceConfirmed() {
-		if common.QuotaForInvitee > 0 {
-			_ = IncreaseUserQuota(user.Id, common.QuotaForInvitee, true)
-			RecordLog(user.Id, LogTypeSystem, fmt.Sprintf("使用邀请码赠送 %s", logger.LogQuota(common.QuotaForInvitee)))
-		}
-		if common.QuotaForInviter > 0 {
-			//_ = IncreaseUserQuota(inviterId, common.QuotaForInviter)
-			RecordLog(inviterId, LogTypeSystem, fmt.Sprintf("邀请用户赠送 %s", logger.LogQuota(common.QuotaForInviter)))
-			_ = inviteUser(inviterId)
-		}
-	}
+	grantInviteRewards(user.Id, inviterId)
 }
 
 func (user *User) FinishInsert(inviterId int) {
@@ -772,16 +791,7 @@ func (user *User) FinalizeOAuthUserCreation(inviterId int) {
 	if common.QuotaForNewUser > 0 {
 		RecordLog(user.Id, LogTypeSystem, fmt.Sprintf("新用户注册赠送 %s", logger.LogQuota(common.QuotaForNewUser)))
 	}
-	if inviterId != 0 && operation_setting.IsPaymentComplianceConfirmed() {
-		if common.QuotaForInvitee > 0 {
-			_ = IncreaseUserQuota(user.Id, common.QuotaForInvitee, true)
-			RecordLog(user.Id, LogTypeSystem, fmt.Sprintf("使用邀请码赠送 %s", logger.LogQuota(common.QuotaForInvitee)))
-		}
-		if common.QuotaForInviter > 0 {
-			RecordLog(inviterId, LogTypeSystem, fmt.Sprintf("邀请用户赠送 %s", logger.LogQuota(common.QuotaForInviter)))
-			_ = inviteUser(inviterId)
-		}
-	}
+	grantInviteRewards(user.Id, inviterId)
 }
 
 func (user *User) Update(updatePassword bool) error {

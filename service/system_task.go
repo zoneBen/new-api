@@ -474,6 +474,8 @@ type SystemTaskProgress struct {
 // emitting the first update and the final 100%.
 // Lock-loss errors are ignored: the lease heartbeat cancels the handler ctx on
 // loss, so progress writes are best-effort and never abort the run themselves.
+// Other write failures are logged instead of dropped, since a frozen progress
+// bar is otherwise indistinguishable from a slow task.
 // The returned func is single-goroutine only (call it from the handler loop).
 func NewSystemTaskProgressReporter(task *model.SystemTask, runnerID string) func(processed, total int) {
 	const minWriteInterval = 2 * time.Second
@@ -504,7 +506,11 @@ func NewSystemTaskProgressReporter(task *model.SystemTask, runnerID string) func
 		lastWriteAt = time.Now()
 
 		state := SystemTaskProgress{Total: total, Processed: processed, Progress: progress}
-		_ = model.UpdateSystemTaskState(task.TaskID, runnerID, state)
+		if err := model.UpdateSystemTaskState(task.TaskID, runnerID, state); err != nil && !errors.Is(err, model.ErrSystemTaskLockLost) {
+			// Lock loss is expected here, but any other failure would leave the
+			// progress bar frozen at its last value with no trace at all.
+			logger.LogWarn(context.Background(), fmt.Sprintf("system task %s progress write failed: %v", task.TaskID, err))
+		}
 	}
 }
 

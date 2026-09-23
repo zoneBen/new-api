@@ -105,27 +105,46 @@ func SaveQuotaDataCache() {
 	// 1. 先查询数据库中是否有数据
 	// 2. 如果有数据，就更新数据
 	// 3. 如果没有数据，就插入数据
+	failed := 0
 	for _, quotaData := range CacheQuotaData {
-		quotaDataDB := &QuotaData{}
-		DB.Table("quota_data").
-			Where("user_id = ? and username = ? and model_name = ? and created_at = ? and use_group = ? and token_id = ? and channel_id = ? and node_name = ?",
-				quotaData.UserID, quotaData.Username, quotaData.ModelName, quotaData.CreatedAt, quotaData.UseGroup, quotaData.TokenID, quotaData.ChannelID, quotaData.NodeName).
-			First(quotaDataDB)
-		if quotaDataDB.Id > 0 {
-			//quotaDataDB.Count += quotaData.Count
-			//quotaDataDB.Quota += quotaData.Quota
-			//DB.Table("quota_data").Save(quotaDataDB)
-			increaseQuotaData(quotaData)
-		} else {
-			DB.Table("quota_data").Create(quotaData)
+		if err := saveQuotaDataEntry(quotaData); err != nil {
+			failed++
+			common.SysError(fmt.Sprintf("保存数据看板数据失败: user_id=%d, model_name=%s, error=%s",
+				quotaData.UserID, quotaData.ModelName, err.Error()))
 		}
 	}
 	CacheQuotaData = make(map[string]*QuotaData)
+	// 缓存无论成败都会清空，失败的那些条目就此丢失，所以必须显式报告，
+	// 否则数据看板少统计的部分不会有任何痕迹。
+	if failed > 0 {
+		common.SysError(fmt.Sprintf("保存数据看板数据完成，共 %d 条，失败 %d 条", size, failed))
+		return
+	}
 	common.SysLog(fmt.Sprintf("保存数据看板数据成功，共保存%d条数据", size))
 }
 
-func increaseQuotaData(quotaData *QuotaData) {
+// saveQuotaDataEntry writes one aggregated cache entry to quota_data, updating
+// the existing row for the same dimension tuple or inserting a new one.
+func saveQuotaDataEntry(quotaData *QuotaData) error {
+	quotaDataDB := &QuotaData{}
 	err := DB.Table("quota_data").
+		Where("user_id = ? and username = ? and model_name = ? and created_at = ? and use_group = ? and token_id = ? and channel_id = ? and node_name = ?",
+			quotaData.UserID, quotaData.Username, quotaData.ModelName, quotaData.CreatedAt, quotaData.UseGroup, quotaData.TokenID, quotaData.ChannelID, quotaData.NodeName).
+		First(quotaDataDB).Error
+	exists, err := RecordExist(err)
+	if err != nil {
+		// 查询失败不能当作"还没有这一行"：那样会插入一条重复记录，
+		// 之后每次看板查询都会把这个维度统计两遍。
+		return err
+	}
+	if exists {
+		return increaseQuotaData(quotaData)
+	}
+	return DB.Table("quota_data").Create(quotaData).Error
+}
+
+func increaseQuotaData(quotaData *QuotaData) error {
+	return DB.Table("quota_data").
 		Where("user_id = ? and username = ? and model_name = ? and created_at = ? and use_group = ? and token_id = ? and channel_id = ? and node_name = ?",
 			quotaData.UserID, quotaData.Username, quotaData.ModelName, quotaData.CreatedAt, quotaData.UseGroup, quotaData.TokenID, quotaData.ChannelID, quotaData.NodeName).
 		Updates(map[string]any{
@@ -133,9 +152,6 @@ func increaseQuotaData(quotaData *QuotaData) {
 			"quota":      gorm.Expr("quota + ?", quotaData.Quota),
 			"token_used": gorm.Expr("token_used + ?", quotaData.TokenUsed),
 		}).Error
-	if err != nil {
-		common.SysLog(fmt.Sprintf("increaseQuotaData error: %s", err))
-	}
 }
 
 func GetQuotaDataByUsername(username string, startTime int64, endTime int64) (quotaData []*QuotaData, err error) {

@@ -2,6 +2,7 @@ package relay
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -524,6 +525,9 @@ func videoFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *d
 // tryRealtimeFetch 尝试从上游实时拉取 Gemini/Vertex 任务状态。
 // 仅当渠道类型为 Gemini 或 Vertex 时触发；其他渠道或出错时返回 nil。
 // 当非 OpenAI Video API 时，还会构建自定义格式的响应体。
+//
+// 返回 nil 时调用方回退到 task 自身构造响应，所以凡是提前返回的分支都必须
+// 保证 task 与数据库一致：状态写库失败时会先 Restore 到快照再返回。
 func tryRealtimeFetch(task *model.Task, isOpenAIVideoAPI bool) []byte {
 	channelModel, err := model.GetChannelById(task.ChannelId, true)
 	if err != nil {
@@ -576,8 +580,16 @@ func tryRealtimeFetch(task *model.Task, isOpenAIVideoAPI bool) []byte {
 		task.PrivateData.ResultURL = taskcommon.BuildProxyURL(task.TaskID)
 	}
 
-	if !snap.Equal(task.Snapshot()) {
-		_, _ = task.UpdateWithStatus(snap.Status)
+	if err := task.PersistIfChanged(snap); err != nil {
+		// The fresh upstream state never reached the database: either the write
+		// failed or another writer moved the task out of the status this update
+		// was guarded by. Reporting the in-memory values would hand the client a
+		// transition that no later fetch confirms, so this realtime refresh is
+		// given up — PersistIfChanged already put the task back to what the
+		// database holds, and the caller answers from that instead.
+		logger.LogWarn(context.Background(), fmt.Sprintf(
+			"realtime task refresh for %s not persisted, falling back to the stored state: %v", task.TaskID, err))
+		return nil
 	}
 
 	// OpenAI Video API 由调用者的 ConvertToOpenAIVideo 分支处理
