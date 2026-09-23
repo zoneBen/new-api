@@ -221,7 +221,7 @@ func GetAndValidOpenAIImageRequest(c *gin.Context, relayMode int) (*dto.ImageReq
 
 			if imageRequest.Model == "gpt-image-1" {
 				if imageRequest.Quality == "" {
-					imageRequest.Quality = "standard"
+					imageRequest.Quality = dto.DefaultGptImageQuality
 				}
 			}
 			if imageRequest.N == nil || *imageRequest.N == 0 {
@@ -259,7 +259,9 @@ func GetAndValidOpenAIImageRequest(c *gin.Context, relayMode int) (*dto.ImageReq
 		}
 		if imageRequest.Model == "gpt-image-1" {
 			if imageRequest.Quality == "" {
-				imageRequest.Quality = "auto"
+				// Same constant as the multipart branch above: the resolved quality
+				// feeds pricing, so both transports must agree on the default.
+				imageRequest.Quality = dto.DefaultGptImageQuality
 			}
 		}
 

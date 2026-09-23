@@ -55,6 +55,123 @@ func TestLegacyDalleValidationAndPricesRemainCompatible(t *testing.T) {
 	}
 }
 
+// TestImageRequestQualityDefaultIsSharedAcrossTransports pins that both image
+// transports resolve the same gpt-image-1 quality when the client omits it. The
+// resolved value is frozen into the billing request input as u("quality") and is
+// also the value relayed upstream, so a transport-specific default priced (and
+// served) the same image differently: the multipart edits path used dall-e's
+// "standard", which gpt-image-1 rejects.
+func TestImageRequestQualityDefaultIsSharedAcrossTransports(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	for _, tc := range []struct {
+		name      string
+		relayMode int
+		multipart bool
+		body      string
+		quality   string
+	}{
+		{
+			name:      "json generations fills the model default",
+			relayMode: relayconstant.RelayModeImagesGenerations,
+			body:      `{"model":"gpt-image-1","prompt":"a cat"}`,
+			quality:   dto.DefaultGptImageQuality,
+		},
+		{
+			name:      "json edits fills the model default",
+			relayMode: relayconstant.RelayModeImagesEdits,
+			body:      `{"model":"gpt-image-1","prompt":"a cat"}`,
+			quality:   dto.DefaultGptImageQuality,
+		},
+		{
+			name:      "multipart edits fills the model default",
+			relayMode: relayconstant.RelayModeImagesEdits,
+			multipart: true,
+			quality:   dto.DefaultGptImageQuality,
+		},
+		{
+			name:      "json generations keeps the requested quality",
+			relayMode: relayconstant.RelayModeImagesGenerations,
+			body:      `{"model":"gpt-image-1","prompt":"a cat","quality":"high"}`,
+			quality:   "high",
+		},
+		{
+			name:      "multipart edits keeps the requested quality",
+			relayMode: relayconstant.RelayModeImagesEdits,
+			multipart: true,
+			body:      "high",
+			quality:   "high",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var c *gin.Context
+			if tc.multipart {
+				c = newMultipartImageContext(t, "/v1/images/edits", "gpt-image-1", tc.body)
+			} else {
+				c = newJSONImageContext(t, "/v1/images/generations", tc.body)
+			}
+
+			request, err := GetAndValidOpenAIImageRequest(c, tc.relayMode)
+			require.NoError(t, err)
+			require.Equal(t, tc.quality, request.Quality)
+
+			input, err := ResolveImageBillingRequestInput(c, &relaycommon.RelayInfo{Request: request}, billingexpr.RequestInput{})
+			require.NoError(t, err)
+			require.Contains(t, string(input.Body), fmt.Sprintf(`"quality":%q`, tc.quality),
+				"the frozen billing input must carry the resolved quality")
+		})
+	}
+}
+
+// TestMultipartQualityDefaultStaysScopedToGptImage pins the other half of the
+// unification: a multipart request for a legacy model still leaves quality to
+// the upstream, so the shared default cannot leak a parameter that dall-e-2
+// does not accept.
+func TestMultipartQualityDefaultStaysScopedToGptImage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	for _, model := range []string{"dall-e-2", "dall-e-3"} {
+		t.Run(model, func(t *testing.T) {
+			c := newMultipartImageContext(t, "/v1/images/edits", model, "")
+
+			request, err := GetAndValidOpenAIImageRequest(c, relayconstant.RelayModeImagesEdits)
+			require.NoError(t, err)
+			require.Empty(t, request.Quality)
+
+			input, err := ResolveImageBillingRequestInput(c, &relaycommon.RelayInfo{Request: request}, billingexpr.RequestInput{})
+			require.NoError(t, err)
+			require.Contains(t, string(input.Body), `"quality":""`)
+		})
+	}
+}
+
+func newJSONImageContext(t *testing.T, path string, body string) *gin.Context {
+	t.Helper()
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	return c
+}
+
+// newMultipartImageContext builds an image edit form; quality is only sent when
+// the caller supplies one, which is how the transport omits the field.
+func newMultipartImageContext(t *testing.T, path string, model string, quality string) *gin.Context {
+	t.Helper()
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	require.NoError(t, writer.WriteField("model", model))
+	require.NoError(t, writer.WriteField("prompt", "edit this image"))
+	if quality != "" {
+		require.NoError(t, writer.WriteField("quality", quality))
+	}
+	require.NoError(t, writer.Close())
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, path, &body)
+	c.Request.Header.Set("Content-Type", writer.FormDataContentType())
+	return c
+}
+
 // TestGetAndValidOpenAIImageRequestMultipartStream verifies multipart image
 // edit parsing: the stream field is parsed and validated, and the request body
 // stays replayable for the upstream request.

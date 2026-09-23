@@ -14,6 +14,14 @@ import (
 // wrapped-negative n overflows quota calculation into a negative charge.
 const MaxImageN = 128
 
+// DefaultGptImageQuality is the quality gpt-image-1 applies when a request
+// omits one: the model accepts low/medium/high/auto and defaults to auto, while
+// "standard" is a dall-e-3 value that gpt-image-1 rejects. The resolved quality
+// is frozen into the billing request input as u("quality") and is sent upstream,
+// so every transport that fills the field in must use this one constant —
+// transport-specific defaults would price and serve the same image differently.
+const DefaultGptImageQuality = "auto"
+
 // ImageBillingParameters contains only the provider scalars parsed by request
 // validation. Keep this separate from the complete provider request payload.
 type ImageBillingParameters struct {

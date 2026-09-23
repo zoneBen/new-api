@@ -177,7 +177,13 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 
 	quality := request.Quality
 	if quality == "" {
+		// Validation fills the field in for gpt-image-1, so this fallback covers
+		// the models that carry dall-e's own default. Naming the model default
+		// here keeps the log from reporting a quality the request never used.
 		quality = "standard"
+		if request.Model == "gpt-image-1" {
+			quality = dto.DefaultGptImageQuality
+		}
 	}
 
 	var logContent []string
