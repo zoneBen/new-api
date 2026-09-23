@@ -449,7 +449,7 @@ func GetChannelById(id int, selectAll bool) (*Channel, error) {
 	return channel, nil
 }
 
-func BatchInsertChannels(channels []Channel) error {
+func BatchInsertChannels(channels []Channel) (err error) {
 	if len(channels) == 0 {
 		return nil
 	}
@@ -457,19 +457,15 @@ func BatchInsertChannels(channels []Channel) error {
 	if tx.Error != nil {
 		return tx.Error
 	}
-	defer func() {
-		if r := recover(); r != nil {
-			tx.Rollback()
-		}
-	}()
+	defer recoverTxPanic(tx, "BatchInsertChannels", &err)
 
 	for _, chunk := range lo.Chunk(channels, 50) {
-		if err := tx.Create(&chunk).Error; err != nil {
+		if err = tx.Create(&chunk).Error; err != nil {
 			tx.Rollback()
 			return err
 		}
 		for _, channel_ := range chunk {
-			if err := channel_.AddAbilities(tx); err != nil {
+			if err = channel_.AddAbilities(tx); err != nil {
 				tx.Rollback()
 				return err
 			}

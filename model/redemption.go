@@ -32,11 +32,7 @@ func GetAllRedemptions(startIdx int, num int) (redemptions []*Redemption, total 
 	if tx.Error != nil {
 		return nil, 0, tx.Error
 	}
-	defer func() {
-		if r := recover(); r != nil {
-			tx.Rollback()
-		}
-	}()
+	defer recoverTxPanic(tx, "GetAllRedemptions", &err)
 
 	// 获取总数
 	err = tx.Model(&Redemption{}).Count(&total).Error
@@ -65,11 +61,7 @@ func SearchRedemptions(keyword string, status string, startIdx int, num int) (re
 	if tx.Error != nil {
 		return nil, 0, tx.Error
 	}
-	defer func() {
-		if r := recover(); r != nil {
-			tx.Rollback()
-		}
-	}()
+	defer recoverTxPanic(tx, "SearchRedemptions", &err)
 
 	query := tx.Model(&Redemption{})
 

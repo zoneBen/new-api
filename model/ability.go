@@ -260,7 +260,9 @@ func (channel *Channel) DeleteAbilities() error {
 
 // UpdateAbilities updates abilities of this channel.
 // Make sure the channel is completed before calling this function.
-func (channel *Channel) UpdateAbilities(tx *gorm.DB) error {
+// A caller that supplies its own tx keeps ownership of it: only the transaction
+// this function started itself is rolled back and reported on a panic.
+func (channel *Channel) UpdateAbilities(tx *gorm.DB) (err error) {
 	isNewTx := false
 	// 如果没有传入事务，创建新的事务
 	if tx == nil {
@@ -269,15 +271,11 @@ func (channel *Channel) UpdateAbilities(tx *gorm.DB) error {
 			return tx.Error
 		}
 		isNewTx = true
-		defer func() {
-			if r := recover(); r != nil {
-				tx.Rollback()
-			}
-		}()
+		defer recoverTxPanic(tx, "UpdateAbilities", &err)
 	}
 
 	// First delete all abilities of this channel
-	err := tx.Where("channel_id = ?", channel.Id).Delete(&Ability{}).Error
+	err = tx.Where("channel_id = ?", channel.Id).Delete(&Ability{}).Error
 	if err != nil {
 		if isNewTx {
 			tx.Rollback()

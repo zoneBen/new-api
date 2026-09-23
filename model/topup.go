@@ -302,11 +302,7 @@ func GetUserTopUps(userId int, pageInfo *common.PageInfo) (topups []*TopUp, tota
 	if tx.Error != nil {
 		return nil, 0, tx.Error
 	}
-	defer func() {
-		if r := recover(); r != nil {
-			tx.Rollback()
-		}
-	}()
+	defer recoverTxPanic(tx, "GetUserTopUps", &err)
 
 	cutoff := topUpQueryCutoff()
 
@@ -338,11 +334,7 @@ func GetAllTopUps(pageInfo *common.PageInfo) (topups []*TopUp, total int64, err 
 	if tx.Error != nil {
 		return nil, 0, tx.Error
 	}
-	defer func() {
-		if r := recover(); r != nil {
-			tx.Rollback()
-		}
-	}()
+	defer recoverTxPanic(tx, "GetAllTopUps", &err)
 
 	if err = tx.Model(&TopUp{}).Count(&total).Error; err != nil {
 		tx.Rollback()
@@ -371,11 +363,7 @@ func SearchUserTopUps(userId int, keyword string, pageInfo *common.PageInfo) (to
 	if tx.Error != nil {
 		return nil, 0, tx.Error
 	}
-	defer func() {
-		if r := recover(); r != nil {
-			tx.Rollback()
-		}
-	}()
+	defer recoverTxPanic(tx, "SearchUserTopUps", &err)
 
 	query := tx.Model(&TopUp{}).Where("user_id = ? AND create_time >= ?", userId, topUpQueryCutoff())
 	if keyword != "" {
@@ -411,11 +399,7 @@ func SearchAllTopUps(keyword string, pageInfo *common.PageInfo) (topups []*TopUp
 	if tx.Error != nil {
 		return nil, 0, tx.Error
 	}
-	defer func() {
-		if r := recover(); r != nil {
-			tx.Rollback()
-		}
-	}()
+	defer recoverTxPanic(tx, "SearchAllTopUps", &err)
 
 	query := tx.Model(&TopUp{})
 	if keyword != "" {

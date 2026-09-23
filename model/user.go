@@ -420,11 +420,7 @@ func GetAllUsers(pageInfo *common.PageInfo, sortOptions ...UserSortOptions) (use
 	if tx.Error != nil {
 		return nil, 0, tx.Error
 	}
-	defer func() {
-		if r := recover(); r != nil {
-			tx.Rollback()
-		}
-	}()
+	defer recoverTxPanic(tx, "GetAllUsers", &err)
 
 	// Get total count within transaction
 	err = tx.Unscoped().Model(&User{}).Count(&total).Error
@@ -449,21 +445,13 @@ func GetAllUsers(pageInfo *common.PageInfo, sortOptions ...UserSortOptions) (use
 	return users, total, nil
 }
 
-func SearchUsers(keyword string, group string, role *int, status *int, startIdx int, num int, sortOptions ...UserSortOptions) ([]*User, int64, error) {
-	var users []*User
-	var total int64
-	var err error
-
+func SearchUsers(keyword string, group string, role *int, status *int, startIdx int, num int, sortOptions ...UserSortOptions) (users []*User, total int64, err error) {
 	// 开始事务
 	tx := DB.Begin()
 	if tx.Error != nil {
 		return nil, 0, tx.Error
 	}
-	defer func() {
-		if r := recover(); r != nil {
-			tx.Rollback()
-		}
-	}()
+	defer recoverTxPanic(tx, "SearchUsers", &err)
 
 	// 构建基础查询
 	query := tx.Unscoped().Model(&User{})
