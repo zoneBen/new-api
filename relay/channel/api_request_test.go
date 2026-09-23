@@ -1,12 +1,16 @@
 package channel
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -23,6 +27,116 @@ func TestNewTaskAPIRequestInheritsClientCancellation(t *testing.T) {
 	cancel()
 
 	require.ErrorIs(t, upstream.Context().Err(), context.Canceled)
+}
+
+// stubAdaptor implements just enough of Adaptor for the relay entry points.
+type stubAdaptor struct {
+	Adaptor
+	baseURL string
+}
+
+func (s *stubAdaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
+	return s.baseURL + "/v1/chat/completions", nil
+}
+
+func (s *stubAdaptor) SetupRequestHeader(c *gin.Context, req *http.Header, info *relaycommon.RelayInfo) error {
+	return nil
+}
+
+// TestDoRequestEntryPointsInheritClientCancellation guards the two upstream HTTP
+// entry points every relay adaptor goes through against dropping the client
+// request context. Without the binding, the upstream transfer keeps running
+// after the client gives up, holding an upstream connection and the quota that
+// was pre-charged for a response nobody is waiting for.
+func TestDoRequestEntryPointsInheritClientCancellation(t *testing.T) {
+	service.InitHttpClient()
+
+	for _, tc := range []struct {
+		name string
+		call func(a Adaptor, c *gin.Context, info *relaycommon.RelayInfo, body io.Reader) (*http.Response, error)
+	}{
+		{
+			name: "DoApiRequest",
+			call: func(a Adaptor, c *gin.Context, info *relaycommon.RelayInfo, body io.Reader) (*http.Response, error) {
+				return DoApiRequest(a, c, info, body)
+			},
+		},
+		{name: "DoFormRequest", call: DoFormRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			arrived := make(chan struct{}, 1)
+			upstreamCancelled := make(chan struct{}, 1)
+			stopWaiting := make(chan struct{})
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// Drain the body first: net/http only starts the background read
+				// that notices a client disconnect once the request body has
+				// been consumed, and this handler never writes a response.
+				_, _ = io.Copy(io.Discard, r.Body)
+				select {
+				case arrived <- struct{}{}:
+				default:
+				}
+				// Park the handler until the client abandons the request or the
+				// test releases it. Only genuine cancellation reports on
+				// upstreamCancelled, so the assertion below cannot pass by the
+				// server simply giving up.
+				select {
+				case <-r.Context().Done():
+					select {
+					case upstreamCancelled <- struct{}{}:
+					default:
+					}
+				case <-stopWaiting:
+				}
+			}))
+			defer server.Close()
+			// Unblock the handler before the server waits for it on Close.
+			defer close(stopWaiting)
+
+			requestContext, cancelRequest := context.WithCancel(context.Background())
+			defer cancelRequest()
+
+			gin.SetMode(gin.TestMode)
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(requestContext)
+			c.Request.Header.Set("Content-Type", "multipart/form-data; boundary=test")
+
+			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}}
+			adaptor := &stubAdaptor{baseURL: server.URL}
+
+			errCh := make(chan error, 1)
+			go func() {
+				resp, err := tc.call(adaptor, c, info, bytes.NewReader([]byte(`{"model":"test-model"}`)))
+				if resp != nil {
+					_ = resp.Body.Close()
+				}
+				errCh <- err
+			}()
+
+			select {
+			case <-arrived:
+			case <-time.After(5 * time.Second):
+				t.Fatal("upstream never received the request")
+			}
+
+			cancelRequest()
+
+			select {
+			case <-upstreamCancelled:
+			case <-time.After(5 * time.Second):
+				t.Fatal("upstream request was not bound to the client request context")
+			}
+
+			select {
+			case err := <-errCh:
+				require.Error(t, err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("the relay call did not return after the client disconnected")
+			}
+		})
+	}
 }
 
 func TestProcessHeaderOverride_ChannelTestSkipsPassthroughRules(t *testing.T) {

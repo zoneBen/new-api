@@ -87,8 +87,9 @@ func uploadDifyFile(c *gin.Context, info *relaycommon.RelayInfo, user string, me
 		}
 		writer.Close()
 
-		// Create HTTP request
-		req, err := http.NewRequest("POST", uploadUrl, body)
+		// Create HTTP request, bound to the client context so an abandoned relay
+		// request cancels the upload instead of finishing it unattended.
+		req, err := http.NewRequestWithContext(c.Request.Context(), "POST", uploadUrl, body)
 		if err != nil {
 			common.SysLog("failed to create request: " + err.Error())
 			return nil
